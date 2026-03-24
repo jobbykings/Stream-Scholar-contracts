@@ -180,3 +180,51 @@ fn test_admin_veto() {
     assert!(!client.has_access(&student, &2));
     assert!(client.has_access(&student, &3)); // Other course in sub should still work
 }
+
+#[test]
+fn test_scholarship_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let teacher = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // 1. Approve teacher
+    client.set_teacher(&admin, &teacher, &true);
+
+    // 2. Fund scholarship for student
+    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+    
+    // Verify contract has tokens and student has balance
+    let token = token::Client::new(&env, &token_address.address());
+    assert_eq!(token.balance(&contract_id), 500);
+    assert_eq!(token.balance(&funder), 500);
+
+    // 3. Student pays teacher from scholarship
+    client.transfer_scholarship_to_teacher(&student, &teacher, &200);
+    
+    assert_eq!(token.balance(&teacher), 200);
+    assert_eq!(token.balance(&contract_id), 300);
+
+    // 4. Try to pay unapproved teacher (should fail)
+    let fake_teacher = Address::generate(&env);
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &soroban_sdk::Symbol::new(&env, "transfer_scholarship_to_teacher"),
+        (student, fake_teacher, 100i128).into_val(&env)
+    );
+    assert!(result.is_err());
+}
