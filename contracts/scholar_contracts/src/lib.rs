@@ -7,6 +7,8 @@ pub enum Event {
     SbtMint(Address, u64),
 }
 
+const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
+
 #[contracttype]
 #[derive(Clone)]
 pub struct Access {
@@ -16,6 +18,13 @@ pub struct Access {
     pub token: Address,
     pub total_watch_time: u64,
     pub last_heartbeat: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Scholarship {
+    pub balance: i128,
+    pub token: Address,
 }
 
 #[contracttype]
@@ -30,6 +39,11 @@ pub enum DataKey {
     HeartbeatInterval,
     CourseDuration(u64),
     SbtMinted(Address, u64),
+    Admin,
+    VetoedCourse(Address, u64),
+    IsTeacher(Address),
+    Scholarship(Address), // student -> Scholarship struct
+    VetoedCourseGlobal(u64),
 }
 
 #[contracttype]
@@ -112,6 +126,9 @@ impl ScholarContract {
         } else {
             access.expiry_time = current_time + seconds_bought;
         }
+        
+        // Update last purchase time to current time
+        access.last_purchase_time = current_time;
 
         env.storage().instance().set(&DataKey::Access(student, course_id), &access);
     }
@@ -174,6 +191,18 @@ impl ScholarContract {
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
+        // Check if course is globally vetoed
+        let is_globally_vetoed: bool = env.storage().instance().get(&DataKey::VetoedCourseGlobal(course_id)).unwrap_or(false);
+        if is_globally_vetoed {
+            return false;
+        }
+
+        // Check if course is vetoed for this student
+        let is_vetoed: bool = env.storage().instance().get(&DataKey::VetoedCourse(student.clone(), course_id)).unwrap_or(false);
+        if is_vetoed {
+            return false;
+        }
+        
         // Check subscription first
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
@@ -221,6 +250,119 @@ impl ScholarContract {
         };
         
         env.storage().instance().set(&DataKey::Subscription(subscriber.clone()), &subscription);
+    }
+
+    pub fn set_admin(env: Env, admin: Address) {
+        admin.require_auth();
+        
+        // Only allow setting admin if not already set
+        let existing_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if existing_admin.is_some() {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::IsTeacher(teacher), &status);
+    }
+
+    pub fn fund_scholarship(env: Env, funder: Address, student: Address, amount: i128, token: Address) {
+        funder.require_auth();
+        
+        let client = token::Client::new(&env, &token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+        
+        let mut scholarship: Scholarship = env.storage().instance()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or(Scholarship {
+                balance: 0,
+                token,
+            });
+            
+        scholarship.balance += amount;
+        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+    }
+
+    pub fn transfer_scholarship_to_teacher(env: Env, student: Address, teacher: Address, amount: i128) {
+        student.require_auth();
+        
+        // Check if teacher is approved
+        let is_approved: bool = env.storage().instance().get(&DataKey::IsTeacher(teacher.clone())).unwrap_or(false);
+        if !is_approved {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let mut scholarship: Scholarship = env.storage().instance()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+            
+        if scholarship.balance < amount {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        scholarship.balance -= amount;
+        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+        
+        // Transfer to teacher
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &teacher, &amount);
+    }
+
+    pub fn veto_course_globally(env: Env, admin: Address, course_id: u64, status: bool) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::VetoedCourseGlobal(course_id), &status);
+    }
+
+    pub fn veto_course_access(env: Env, admin: Address, student: Address, course_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if stored_admin.is_none() || stored_admin.unwrap() != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Mark course as vetoed for this student
+        env.storage().instance().set(&DataKey::VetoedCourse(student.clone(), course_id), &true);
+        
+        // Revoke existing access by setting expiry to 0
+        let access_key = DataKey::Access(student.clone(), course_id);
+        if let Some(mut access) = env.storage().instance().get::<DataKey, Access>(&access_key) {
+            access.expiry_time = 0;
+            env.storage().instance().set(&access_key, &access);
+        }
+        
+        // Remove course from subscription if present
+        let sub_key = DataKey::Subscription(student.clone());
+        if let Some(mut subscription) = env.storage().instance().get::<DataKey, SubscriptionTier>(&sub_key) {
+            // Filter out the vetoed course
+            let mut new_course_ids = Vec::new(&env);
+            for i in 0..subscription.course_ids.len() {
+                let cid = subscription.course_ids.get(i).unwrap();
+                if cid != course_id {
+                    new_course_ids.push_back(cid);
+                }
+            }
+            subscription.course_ids = new_course_ids;
+            env.storage().instance().set(&sub_key, &subscription);
+        }
     }
 }
 
