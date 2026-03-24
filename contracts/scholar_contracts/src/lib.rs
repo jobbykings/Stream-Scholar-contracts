@@ -364,6 +364,22 @@ impl ScholarContract {
             env.storage().instance().set(&sub_key, &subscription);
         }
     }
+
+    pub fn calculate_remaining_airtime(env: Env, student: Address) -> u64 {
+        let flow_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(0);
+        if flow_rate == 0 {
+            return 0;
+        }
+        
+        let scholarship: Option<Scholarship> = env.storage().instance().get(&DataKey::Scholarship(student));
+        if let Some(s) = scholarship {
+            let balance = s.balance;
+            if balance > 0 {
+                return (balance / flow_rate) as u64;
+            }
+        }
+        0
+    }
 }
 
 mod test;

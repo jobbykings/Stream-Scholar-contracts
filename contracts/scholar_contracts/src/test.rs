@@ -456,3 +456,57 @@ fn test_global_course_veto() {
     client.buy_subscription(&student_b, &course_ids_2, &1, &300, &token_address.address());
     assert!(client.has_access(&student_b, &2));
 }
+
+#[test]
+fn test_calculate_remaining_airtime() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    // Initialize with flow_rate (base_rate) of 10
+    client.init(&10, &3600, &10, &100, &60);
+    
+    // Test that calculation correctly returns 0 initially
+    assert_eq!(client.calculate_remaining_airtime(&student), 0);
+
+    // Fund the scholarship with balance of 500
+    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+
+    // 500 balance / 10 flow_rate = 50 seconds
+    assert_eq!(client.calculate_remaining_airtime(&student), 50);
+}
+
+#[test]
+fn test_calculate_remaining_airtime_zero_flow_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    // Initialize with flow_rate (base_rate) of 0
+    client.init(&0, &3600, &10, &100, &60);
+    
+    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+
+    // Should return 0 due to zero flow_rate guard
+    assert_eq!(client.calculate_remaining_airtime(&student), 0);
+}
