@@ -13,6 +13,13 @@ pub struct Access {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct Scholarship {
+    pub balance: i128,
+    pub token: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     Access(Address, u64),
     Price,
@@ -24,6 +31,8 @@ pub enum DataKey {
     HeartbeatInterval,
     Admin,
     VetoedCourse(Address, u64),
+    IsTeacher(Address),
+    Scholarship(Address), // student -> Scholarship struct
 }
 
 #[contracttype]
@@ -211,6 +220,60 @@ impl ScholarContract {
         }
         
         env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    pub fn set_teacher(env: Env, admin: Address, teacher: Address, status: bool) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::IsTeacher(teacher), &status);
+    }
+
+    pub fn fund_scholarship(env: Env, funder: Address, student: Address, amount: i128, token: Address) {
+        funder.require_auth();
+        
+        let client = token::Client::new(&env, &token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+        
+        let mut scholarship: Scholarship = env.storage().instance()
+            .get(&DataKey::Scholarship(student.clone()))
+            .unwrap_or(Scholarship {
+                balance: 0,
+                token,
+            });
+            
+        scholarship.balance += amount;
+        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+    }
+
+    pub fn transfer_scholarship_to_teacher(env: Env, student: Address, teacher: Address, amount: i128) {
+        student.require_auth();
+        
+        // Check if teacher is approved
+        let is_approved: bool = env.storage().instance().get(&DataKey::IsTeacher(teacher.clone())).unwrap_or(false);
+        if !is_approved {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let mut scholarship: Scholarship = env.storage().instance()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+            
+        if scholarship.balance < amount {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        scholarship.balance -= amount;
+        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+        
+        // Transfer to teacher
+        let client = token::Client::new(&env, &scholarship.token);
+        client.transfer(&env.current_contract_address(), &teacher, &amount);
     }
 
     pub fn veto_course_access(env: Env, admin: Address, student: Address, course_id: u64) {
