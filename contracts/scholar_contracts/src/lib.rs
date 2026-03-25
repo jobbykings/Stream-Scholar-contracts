@@ -105,12 +105,13 @@ impl ScholarContract {
             return; // Free access with subscription
         }
 
-        let client = token::Client::new(&env, &token);
-        client.transfer(&student, &env.current_contract_address(), &amount);
-
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
         let seconds_bought = (amount / rate) as u64;
+        let actual_cost = (seconds_bought as i128) * rate;
         let current_time = env.ledger().timestamp();
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&student, &env.current_contract_address(), &actual_cost);
 
         let mut access = env.storage().persistent().get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
@@ -407,6 +408,12 @@ impl ScholarContract {
         
         if current_time > access.last_purchase_time + EARLY_DROP_WINDOW_SECONDS {
             panic!("Refund only available within 5 minutes of purchase");
+        }
+
+        if current_time >= access.expiry_time {
+            return 0;
+        }
+
         }
 
         if current_time >= access.expiry_time {
