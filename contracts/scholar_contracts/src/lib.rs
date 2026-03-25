@@ -414,6 +414,12 @@ impl ScholarContract {
             return 0;
         }
 
+        }
+
+        if current_time >= access.expiry_time {
+            return 0;
+        }
+
         let remaining_seconds = access.expiry_time - current_time;
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
         let refund_amount = (remaining_seconds as i128) * rate;

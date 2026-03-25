@@ -379,6 +379,7 @@ fn test_decimals_and_leak_prevention() {
 }
 
 #[test]
+
 fn test_admin_veto() {
     let env = Env::default();
     env.mock_all_auths();
