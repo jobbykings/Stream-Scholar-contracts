@@ -325,7 +325,14 @@ impl ScholarContract {
             });
             
         scholarship.balance += amount;
-        env.storage().instance().set(&DataKey::Scholarship(student), &scholarship);
+        env.storage().instance().set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        // Emit Scholarship_Granted event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Scholarship_Granted"), funder, student),
+            amount
+        );
     }
 
     pub fn transfer_scholarship_to_teacher(env: Env, student: Address, teacher: Address, amount: i128) {
