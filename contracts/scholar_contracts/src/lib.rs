@@ -53,6 +53,9 @@ pub enum DataKey {
     CourseRegistry,
     CourseRegistrySize,
     CourseInfo(u64),
+    BonusMinutes(Address),
+    HasBeenReferred(Address),
+    ReferralBonusAmount,
 }
 
 #[contracttype]
@@ -155,7 +158,9 @@ impl ScholarContract {
             access.expiry_time = current_time + seconds_bought;
         }
         
-
+        access.last_purchase_time = current_time;
+        env.storage().persistent().set(&DataKey::Access(student.clone(), course_id), &access);
+        env.storage().persistent().extend_ttl(&DataKey::Access(student.clone(), course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
 
     pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
@@ -242,14 +247,15 @@ impl ScholarContract {
     }
 
     pub fn get_watch_time(env: Env, student: Address, course_id: u64) -> u64 {
-        let access: Access = env.storage().instance().get(&DataKey::Access(student, course_id))
+        let access: Access = env.storage().persistent().get(&DataKey::Access(student.clone(), course_id))
             .unwrap_or(Access {
-                student: Address::generate(&env), // dummy
+                student: student.clone(), // dummy
                 course_id,
                 expiry_time: 0,
-                token: Address::generate(&env), // dummy
+                token: student, // dummy
                 total_watch_time: 0,
                 last_heartbeat: 0,
+                last_purchase_time: 0,
             });
         access.total_watch_time
     }
@@ -370,7 +376,7 @@ impl ScholarContract {
         // Emit Scholarship_Granted event
         #[allow(deprecated)]
         env.events().publish(
-            (Symbol::new(&env, "Scholarship_Granted"), funder, student),
+            (Symbol::new(&env, "Scholarship_Granted"), funder, student.clone()),
             amount
         );
         env.storage().persistent().set(&DataKey::Scholarship(student), &scholarship);
@@ -512,6 +518,8 @@ impl ScholarContract {
         // Transfer back to student
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &student, &amount);
+    }
+    
     // Course Registry Management Functions
     
     pub fn add_course_to_registry(env: Env, course_id: u64, creator: Address) {
@@ -525,7 +533,7 @@ impl ScholarContract {
         // Check registry size limit to prevent gas limit issues
         let registry_size: u64 = env.storage().persistent().get(&DataKey::CourseRegistrySize).unwrap_or(0);
         if registry_size >= MAX_COURSE_REGISTRY_SIZE {
-            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::LimitExceeded));
+            panic!("LimitExceeded");
         }
         
         let current_time = env.ledger().timestamp();
@@ -587,14 +595,12 @@ impl ScholarContract {
         env.storage().persistent().extend_ttl(&DataKey::CourseRegistry, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
         
         let total_courses = registry.courses.len();
-        let offset = offset as usize;
-        let limit = limit as usize;
         
         if offset >= total_courses {
             return Vec::new(&env);
         }
         
-        let end_index = std::cmp::min(offset + limit, total_courses);
+        let end_index = core::cmp::min(offset + limit, total_courses);
         let mut result = Vec::new(&env);
         
         for i in offset..end_index {
@@ -606,7 +612,7 @@ impl ScholarContract {
     
     pub fn get_course_info(env: Env, course_id: u64) -> CourseInfo {
         let course_info: CourseInfo = env.storage().persistent().get(&DataKey::CourseInfo(course_id))
-            .unwrap_or_else(|| env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::NotFound)));
+            .unwrap_or_else(|| panic!("NotFound"));
         
         // Extend TTL to prevent data expiration
         env.storage().persistent().extend_ttl(&DataKey::CourseInfo(course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
@@ -624,7 +630,7 @@ impl ScholarContract {
         }
         
         let mut course_info: CourseInfo = env.storage().persistent().get(&DataKey::CourseInfo(course_id))
-            .unwrap_or_else(|| env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::NotFound)));
+            .unwrap_or_else(|| panic!("NotFound"));
         
         course_info.is_active = false;
         env.storage().persistent().set(&DataKey::CourseInfo(course_id), &course_info);
@@ -679,6 +685,69 @@ impl ScholarContract {
         env.storage().persistent().extend_ttl(&DataKey::CourseRegistrySize, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
         
         removed_count
+    }
+    
+    // Referral System
+    
+    pub fn set_referral_bonus_amount(env: Env, admin: Address, amount: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::ReferralBonusAmount, &amount);
+    }
+
+    pub fn referral_reward_claim(env: Env, referrer: Address, friend: Address) {
+        friend.require_auth();
+        
+        // Ensure the friend hasn't already been referred
+        let has_been_referred: bool = env.storage().persistent()
+            .get(&DataKey::HasBeenReferred(friend.clone()))
+            .unwrap_or(false);
+            
+        if has_been_referred {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Get configured bonus amount, default to 3600 seconds (60 minutes)
+        let bonus_amount: u64 = env.storage().instance()
+            .get(&DataKey::ReferralBonusAmount)
+            .unwrap_or(3600);
+            
+        // Add to referrer's bonus minutes balance
+        let mut current_bonus: u64 = env.storage().persistent()
+            .get(&DataKey::BonusMinutes(referrer.clone()))
+            .unwrap_or(0);
+            
+        current_bonus += bonus_amount;
+        
+        env.storage().persistent().set(&DataKey::BonusMinutes(referrer.clone()), &current_bonus);
+        env.storage().persistent().extend_ttl(&DataKey::BonusMinutes(referrer.clone()), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Mark friend as referred
+        env.storage().persistent().set(&DataKey::HasBeenReferred(friend.clone()), &true);
+        env.storage().persistent().extend_ttl(&DataKey::HasBeenReferred(friend.clone()), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit an event for the referral
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Referral_Claimed"), referrer, friend.clone()),
+            bonus_amount
+        );
+    }
+
+    pub fn get_bonus_minutes(env: Env, student: Address) -> u64 {
+        let key = DataKey::BonusMinutes(student);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(0)
+        } else {
+            0
+        }
     }
 }
 
