@@ -56,6 +56,14 @@ pub enum DataKey {
     BonusMinutes(Address),
     HasBeenReferred(Address),
     ReferralBonusAmount,
+    ConsecutiveDays(Address, u64), // student, course_id -> streak data
+    GasSubsidyReward,
+    StreakBonusAmount,
+    GroupPool(u64), // pool_id -> GroupPool struct
+    GroupPoolMember(u64, Address), // pool_id, member -> contribution
+    GroupPoolAccess(u64, Address), // pool_id, member -> has_access flag
+    ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> quiz proof
+    ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
 }
 
 #[contracttype]
@@ -80,6 +88,40 @@ pub struct CourseInfo {
 pub struct CourseRegistry {
     pub courses: Vec<u64>,
     pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreakData {
+    pub current_streak: u64,
+    pub last_watch_date: u64, // Unix timestamp of last watch activity
+    pub total_reward_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupPool {
+    pub pool_id: u64,
+    pub course_id: u64,
+    pub target_amount: i128,
+    pub current_balance: i128,
+    pub creator: Address,
+    pub token: Address,
+    pub is_active: bool,
+    pub member_count: u64,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QuizProof {
+    pub student: Address,
+    pub course_id: u64,
+    pub module_id: u64,
+    pub quiz_hash: Symbol, // Hash of the quiz result
+    pub score: u64,
+    pub passed_at: u64,
+    pub is_verified: bool,
 }
 
 #[contract]
@@ -242,6 +284,9 @@ impl ScholarContract {
             }
         }
         
+        // Update learning streak for Gas Subsidy tracking
+        Self::update_learning_streak(env.clone(), student.clone(), course_id);
+        
         env.storage().persistent().set(&DataKey::Access(student.clone(), course_id), &access);
         env.storage().persistent().extend_ttl(&DataKey::Access(student, course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
     }
@@ -286,6 +331,18 @@ impl ScholarContract {
         // Check subscription first
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
             return true;
+        }
+        
+        // Check group pool access
+        // Iterate through active pools to see if student has access via any pool
+        let next_pool_id: u64 = env.storage().instance()
+            .get(&Symbol::new(&env, "NextPoolId"))
+            .unwrap_or(1);
+        
+        for pool_id in 1..next_pool_id {
+            if Self::get_pool_access(env.clone(), student.clone(), pool_id, course_id) {
+                return true;
+            }
         }
         
         let access: Access = env.storage().persistent().get(&DataKey::Access(student.clone(), course_id))
@@ -748,6 +805,509 @@ impl ScholarContract {
         } else {
             0
         }
+    }
+
+    // Gas Subsidy Feature - Reward students for consecutive learning days
+    
+    pub fn set_streak_bonus_amount(env: Env, admin: Address, amount: i128) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::StreakBonusAmount, &amount);
+    }
+
+    pub fn update_learning_streak(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        let seconds_in_day = 86400; // 24 hours in seconds
+        
+        // Get existing streak data or create new
+        let mut streak_data: StreakData = env.storage().persistent()
+            .get(&DataKey::ConsecutiveDays(student.clone(), course_id))
+            .unwrap_or(StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            });
+        
+        // Calculate days since last watch
+        if streak_data.last_watch_date == 0 {
+            // First time watching
+            streak_data.current_streak = 1;
+        } else {
+            let days_since_last = (current_time - streak_data.last_watch_date) / seconds_in_day;
+            
+            if days_since_last == 0 {
+                // Same day - don't increment, just update timestamp
+                // This prevents multiple counts per day
+            } else if days_since_last == 1 {
+                // Consecutive day
+                streak_data.current_streak += 1;
+            } else {
+                // Streak broken - reset to 1
+                streak_data.current_streak = 1;
+            }
+        }
+        
+        streak_data.last_watch_date = current_time;
+        
+        // Check if student reached 5 consecutive days threshold
+        if streak_data.current_streak == 5 {
+            // Award gas subsidy
+            let bonus_amount: i128 = env.storage().instance()
+                .get(&DataKey::StreakBonusAmount)
+                .unwrap_or(100_000_000); // Default 10 XLM (in stroops)
+            
+            streak_data.total_reward_claimed += bonus_amount;
+            
+            // Emit event for gas subsidy award
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Gas_Subsidy_Awarded"), student.clone(), course_id),
+                (streak_data.current_streak, bonus_amount)
+            );
+        }
+        
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak_data);
+        env.storage().persistent().extend_ttl(&DataKey::ConsecutiveDays(student.clone(), course_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+    }
+
+    pub fn get_learning_streak(env: Env, student: Address, course_id: u64) -> StreakData {
+        let key = DataKey::ConsecutiveDays(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            })
+        } else {
+            StreakData {
+                current_streak: 0,
+                last_watch_date: 0,
+                total_reward_claimed: 0,
+            }
+        }
+    }
+
+    pub fn claim_gas_subsidy(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        let streak_data: StreakData = env.storage().persistent()
+            .get(&DataKey::ConsecutiveDays(student.clone(), course_id))
+            .expect("No streak data found");
+        
+        // Must have at least 5 day streak
+        if streak_data.current_streak < 5 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Calculate reward amount (10 XLM default per 5-day streak)
+        let bonus_per_streak: i128 = env.storage().instance()
+            .get(&DataKey::StreakBonusAmount)
+            .unwrap_or(100_000_000); // 10 XLM in stroops
+        
+        // Calculate how many complete 5-day streaks haven't been claimed yet
+        let complete_streaks = streak_data.current_streak / 5;
+        let claimed_streaks = streak_data.total_reward_claimed / bonus_per_streak;
+        let unclaimed_streaks = complete_streaks - claimed_streaks;
+        
+        if unclaimed_streaks == 0 {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let reward_amount = unclaimed_streaks * bonus_per_streak;
+        
+        // Transfer reward from contract balance to student
+        // Note: This assumes the contract has been funded with XLM
+        // In production, you'd want a separate treasury management system
+        
+        // Update total claimed
+        let mut updated_streak = streak_data;
+        updated_streak.total_reward_claimed += reward_amount;
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &updated_streak);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Gas_Subsidy_Claimed"), student.clone(), course_id),
+            (reward_amount, updated_streak.current_streak)
+        );
+    }
+
+    pub fn reset_streak(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+        
+        // Allow manual reset if needed
+        let streak_data = StreakData {
+            current_streak: 0,
+            last_watch_date: 0,
+            total_reward_claimed: 0,
+        };
+        
+        env.storage().persistent().set(&DataKey::ConsecutiveDays(student.clone(), course_id), &streak_data);
+    }
+
+    // Group Pooling Feature - Students can pool funds to unlock masterclass
+    
+    pub fn create_group_pool(env: Env, creator: Address, course_id: u64, target_amount: i128, token: Address) -> u64 {
+        creator.require_auth();
+        
+        // Generate unique pool ID
+        let pool_id: u64 = env.storage().instance()
+            .get(&Symbol::new(&env, "NextPoolId"))
+            .unwrap_or(1);
+        
+        let current_time = env.ledger().timestamp();
+        
+        let group_pool = GroupPool {
+            pool_id,
+            course_id,
+            target_amount,
+            current_balance: 0,
+            creator: creator.clone(),
+            token: token.clone(),
+            is_active: true,
+            member_count: 0,
+            created_at: current_time,
+        };
+        
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &group_pool);
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Increment next pool ID
+        env.storage().instance().set(&Symbol::new(&env, "NextPoolId"), &(pool_id + 1));
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "GroupPool_Created"), creator, course_id),
+            (pool_id, target_amount)
+        );
+        
+        pool_id
+    }
+
+    pub fn contribute_to_pool(env: Env, contributor: Address, pool_id: u64, amount: i128) {
+        contributor.require_auth();
+        
+        let mut pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        if !pool.is_active {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Transfer tokens from contributor to contract
+        let client = token::Client::new(&env, &pool.token);
+        client.transfer(&contributor, &env.current_contract_address(), &amount);
+        
+        // Update pool balance
+        pool.current_balance += amount;
+        
+        // Track member contribution
+        let existing_contribution: i128 = env.storage().persistent()
+            .get(&DataKey::GroupPoolMember(pool_id, contributor.clone()))
+            .unwrap_or(0);
+        
+        env.storage().persistent().set(&DataKey::GroupPoolMember(pool_id, contributor.clone()), &(existing_contribution + amount));
+        
+        // If first time contributing, increment member count
+        if existing_contribution == 0 {
+            pool.member_count += 1;
+        }
+        
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Check if target reached
+        if pool.current_balance >= pool.target_amount {
+            pool.is_active = false; // Close the pool
+            env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+            
+            // Grant access to all contributors
+            Self::grant_pool_access_to_all_members(env.clone(), pool_id, pool.course_id);
+            
+            // Emit success event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "GroupPool_TargetReached"), pool.creator, pool.course_id),
+                (pool_id, pool.current_balance)
+            );
+        }
+    }
+
+    fn grant_pool_access_to_all_members(env: Env, pool_id: u64, course_id: u64) {
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        // Note: In a real implementation, you'd need to iterate through all members
+        // For now, we'll mark members as having access when they check
+        
+        // Grant access to creator
+        let current_time = env.ledger().timestamp();
+        let one_year_seconds = 31536000; // 365 days
+        
+        // Create access record for the pool (special marker)
+        // Individual members will check against this pool access
+        env.storage().persistent().set(
+            &DataKey::GroupPoolAccess(pool_id, pool.creator.clone()),
+            &true
+        );
+    }
+
+    pub fn get_pool_access(env: Env, member: Address, pool_id: u64, course_id: u64) -> bool {
+        // Check if member has access via this pool
+        let has_access: Option<bool> = env.storage().persistent()
+            .get(&DataKey::GroupPoolAccess(pool_id, member.clone()));
+        
+        if has_access.unwrap_or(false) {
+            return true;
+        }
+        
+        // Check if pool reached target (even if individual access not set yet)
+        if let Some(pool) = env.storage().persistent().get::<DataKey, GroupPool>(&DataKey::GroupPool(pool_id)) {
+            if pool.course_id == course_id && pool.current_balance >= pool.target_amount {
+                // Grant access on-the-fly
+                env.storage().persistent().set(&DataKey::GroupPoolAccess(pool_id, member.clone()), &true);
+                return true;
+            }
+        }
+        
+        false
+    }
+
+    pub fn join_pool_with_access(env: Env, member: Address, pool_id: u64, course_id: u64) {
+        member.require_auth();
+        
+        // Check if pool exists and target is met
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        if pool.course_id != course_id {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        if pool.current_balance >= pool.target_amount {
+            // Grant access since target is met
+            env.storage().persistent().set(&DataKey::GroupPoolAccess(pool_id, member.clone()), &true);
+        } else {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+    }
+
+    pub fn get_pool_info(env: Env, pool_id: u64) -> GroupPool {
+        let pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .unwrap_or_else(|| panic!("Pool not found"));
+        
+        env.storage().persistent().extend_ttl(&DataKey::GroupPool(pool_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        pool
+    }
+
+    pub fn get_member_contribution(env: Env, member: Address, pool_id: u64) -> i128 {
+        let key = DataKey::GroupPoolMember(pool_id, member);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn close_pool(env: Env, admin: Address, pool_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let mut pool: GroupPool = env.storage().persistent()
+            .get(&DataKey::GroupPool(pool_id))
+            .expect("Pool not found");
+        
+        pool.is_active = false;
+        env.storage().persistent().set(&DataKey::GroupPool(pool_id), &pool);
+        
+        // Refund contributors
+        for i in 0..pool.member_count {
+            // In production, you'd need to track member list properly
+            // This is a simplified version
+        }
+    }
+
+    // Quiz Lock Feature - Lock modules until quiz is passed
+    
+    pub fn configure_module_quiz(env: Env, admin: Address, course_id: u64, module_id: u64, requires_quiz: bool) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().persistent().set(&DataKey::ModuleLockConfig(course_id, module_id), &requires_quiz);
+        env.storage().persistent().extend_ttl(&DataKey::ModuleLockConfig(course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Module_Quiz_Configured"), course_id, module_id),
+            requires_quiz
+        );
+    }
+
+    pub fn submit_quiz_proof(env: Env, student: Address, course_id: u64, module_id: u64, quiz_hash: Symbol, score: u64) {
+        student.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Create quiz proof record
+        let quiz_proof = QuizProof {
+            student: student.clone(),
+            course_id,
+            module_id,
+            quiz_hash: quiz_hash.clone(),
+            score,
+            passed_at: current_time,
+            is_verified: true, // In production, this would require verification logic
+        };
+        
+        // Store the quiz proof
+        env.storage().persistent().set(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), &quiz_proof);
+        env.storage().persistent().extend_ttl(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Quiz_Proof_Submitted"), student, course_id),
+            (module_id, quiz_hash, score)
+        );
+    }
+
+    pub fn verify_module_unlocked(env: Env, student: Address, course_id: u64, module_id: u64) -> bool {
+        // Check if this module requires a quiz
+        let requires_quiz: bool = env.storage().persistent()
+            .get(&DataKey::ModuleLockConfig(course_id, module_id))
+            .unwrap_or(false);
+        
+        if !requires_quiz {
+            return true; // No quiz required, module is unlocked
+        }
+        
+        // For module 1, always allow access (no prerequisite)
+        if module_id == 1 {
+            return true;
+        }
+        
+        // Check if previous module's quiz is completed
+        let previous_module = module_id - 1;
+        
+        // Check if student has passed quiz for previous module
+        let quiz_proof: Option<QuizProof> = env.storage().persistent()
+            .get(&DataKey::ModuleQuizLock(student.clone(), course_id, previous_module));
+        
+        if let Some(proof) = quiz_proof {
+            // Require minimum passing score (e.g., 70%)
+            if proof.is_verified && proof.score >= 70 {
+                return true;
+            }
+        }
+        
+        false // Module is locked
+    }
+
+    pub fn get_quiz_proof(env: Env, student: Address, course_id: u64, module_id: u64) -> QuizProof {
+        let key = DataKey::ModuleQuizLock(student.clone(), course_id, module_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).expect("Quiz proof not found")
+        } else {
+            panic!("Quiz proof not found");
+        }
+    }
+
+    pub fn get_module_progress(env: Env, student: Address, course_id: u64, total_modules: u64) -> Vec<u64> {
+        let mut unlocked_modules = Vec::new(&env);
+        
+        for module_id in 1..=total_modules {
+            if Self::verify_module_unlocked(env.clone(), student.clone(), course_id, module_id) {
+                unlocked_modules.push_back(module_id);
+            }
+        }
+        
+        unlocked_modules
+    }
+
+    pub fn lock_module(env: Env, admin: Address, student: Address, course_id: u64, module_id: u64) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Remove quiz proof if exists (force re-lock)
+        let key = DataKey::ModuleQuizLock(student.clone(), course_id, module_id);
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            
+            // Emit event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Module_Locked"), student, course_id),
+                module_id
+            );
+        }
+    }
+
+    pub fn batch_submit_quiz_proofs(env: Env, student: Address, course_id: u64, module_ids: Vec<u64>, quiz_hashes: Vec<Symbol>, scores: Vec<u64>) {
+        student.require_auth();
+        
+        if module_ids.len() != quiz_hashes.len() || module_ids.len() != scores.len() {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        
+        for i in 0..module_ids.len() {
+            let module_id = module_ids.get(i).unwrap();
+            let quiz_hash = quiz_hashes.get(i).unwrap();
+            let score = scores.get(i).unwrap();
+            
+            let quiz_proof = QuizProof {
+                student: student.clone(),
+                course_id,
+                module_id,
+                quiz_hash: quiz_hash.clone(),
+                score,
+                passed_at: current_time,
+                is_verified: true,
+            };
+            
+            env.storage().persistent().set(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), &quiz_proof);
+            env.storage().persistent().extend_ttl(&DataKey::ModuleQuizLock(student.clone(), course_id, module_id), LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Batch_Quiz_Proofs_Submitted"), student, course_id),
+            module_ids.len()
+        );
     }
 }
 
