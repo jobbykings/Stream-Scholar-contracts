@@ -29,6 +29,9 @@ pub struct Access {
 pub struct Scholarship {
     pub balance: i128,
     pub token: Address,
+    pub unlocked_balance: i128,
+    pub last_verif: u64,
+    pub is_paused: bool,
 }
 
 #[contracttype]
@@ -56,6 +59,7 @@ pub enum DataKey {
     HasBeenReferred(Address),
     ReferralBonusAmount,
     RoyaltySplit(u64), // course_id -> RoyaltySplit
+    AcademicOracle,
 }
 
 #[contracttype]
@@ -531,11 +535,17 @@ impl ScholarContract {
             .storage()
             .persistent()
             .get(&DataKey::Scholarship(student.clone()))
-            .unwrap_or(Scholarship { balance: 0, token });
+            .unwrap_or(Scholarship {
+                balance: 0,
+                token,
+                unlocked_balance: 0,
+                last_verif: 0,
+                is_paused: false,
+            });
 
         scholarship.balance += amount;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
 
         // Emit Scholarship_Granted event
@@ -548,9 +558,6 @@ impl ScholarContract {
             ),
             amount,
         );
-        env.storage()
-            .persistent()
-            .set(&DataKey::Scholarship(student), &scholarship);
     }
 
     pub fn transfer_scholarship_to_teacher(
@@ -580,6 +587,14 @@ impl ScholarContract {
             .get(&DataKey::Scholarship(student.clone()))
             .expect("No scholarship found");
 
+        if scholarship.is_paused {
+            panic!("Scholarship is paused");
+        }
+
+        if scholarship.unlocked_balance < amount {
+            panic!("Insufficient unlocked balance. Need academic verification?");
+        }
+
         if scholarship.balance < amount {
             env.panic_with_error((
                 soroban_sdk::xdr::ScErrorType::Contract,
@@ -588,6 +603,7 @@ impl ScholarContract {
         }
 
         scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student), &scholarship);
@@ -711,9 +727,9 @@ impl ScholarContract {
         }
 
         let scholarship: Option<Scholarship> =
-            env.storage().instance().get(&DataKey::Scholarship(student));
+            env.storage().persistent().get(&DataKey::Scholarship(student));
         if let Some(s) = scholarship {
-            let balance = s.balance;
+            let balance = s.unlocked_balance;
             if balance > 0 {
                 return (balance / flow_rate) as u64;
             }
@@ -726,9 +742,17 @@ impl ScholarContract {
 
         let mut scholarship: Scholarship = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Scholarship(student.clone()))
             .expect("No scholarship found");
+
+        if scholarship.is_paused {
+            panic!("Scholarship is paused");
+        }
+
+        if scholarship.unlocked_balance < amount {
+            panic!("Insufficient unlocked balance. Need academic verification?");
+        }
 
         if scholarship.balance < amount {
             env.panic_with_error((
@@ -738,13 +762,111 @@ impl ScholarContract {
         }
 
         scholarship.balance -= amount;
+        scholarship.unlocked_balance -= amount;
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
 
         // Transfer back to student
         let client = token::Client::new(&env, &scholarship.token);
         client.transfer(&env.current_contract_address(), &student, &amount);
+    }
+
+    pub fn set_academic_oracle(env: Env, admin: Address, oracle: Address) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::AcademicOracle, &oracle);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Academic_Oracle_Updated"), admin),
+            oracle,
+        );
+    }
+
+    pub fn get_academic_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AcademicOracle)
+    }
+
+    pub fn pause_scholarship(env: Env, admin: Address, student: Address, status: bool) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            panic!("Unauthorized");
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        scholarship.is_paused = status;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Scholarship_Status_Updated"), student),
+            status,
+        );
+    }
+
+    pub fn verify_academic_progress(env: Env, student: Address, course_id: u64) {
+        student.require_auth();
+
+        let oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AcademicOracle)
+            .expect("Academic Oracle not set");
+
+        // Call the external oracle
+        // Assumption: Oracle has a function `check_status(student: Address, course_id: u64) -> u32`
+        // 0: Fail, 1: Success, 2: Incomplete
+        let status: u32 = env.invoke_contract(
+            &oracle,
+            &Symbol::new(&env, "check_status"),
+            (student.clone(), course_id).into_val(&env),
+        );
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if status == 1 {
+            // Success - unlock next 30 days of drips
+            let base_rate: i128 = env.storage().instance().get(&DataKey::BaseRate).unwrap_or(0);
+            let thirty_days_seconds: i128 = 30 * 24 * 3600;
+            let unlock_amount = thirty_days_seconds * base_rate;
+
+            scholarship.unlocked_balance += unlock_amount;
+            scholarship.last_verif = env.ledger().timestamp();
+            scholarship.is_paused = false;
+
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Scholarship_Drip_Unlocked"), student.clone()),
+                unlock_amount,
+            );
+        } else {
+            // Fail or Incomplete - pause stream
+            scholarship.is_paused = true;
+
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "Scholarship_Paused_By_Oracle"), student.clone()),
+                status,
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student), &scholarship);
     }
 
     pub fn set_royalty_split(

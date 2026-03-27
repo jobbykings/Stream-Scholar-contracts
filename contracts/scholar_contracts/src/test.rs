@@ -686,7 +686,8 @@ fn test_calculate_remaining_airtime_timeout() {
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 
     client.fund_scholarship(&funder, &student, &500, &token_address.address());
-    assert_eq!(client.calculate_remaining_airtime(&student), 50);
+    // Initial unlocked balance is 0
+    assert_eq!(client.calculate_remaining_airtime(&student), 0);
 
     client.init(&10, &3600, &10, &100, &60);
     client.buy_access(&student, &1, &5000, &token_address.address());
@@ -792,13 +793,92 @@ fn test_scholarship_withdrawal() {
     client.init(&10, &3600, &10, &100, &60);
     client.fund_scholarship(&funder, &student, &500, &token_address.address());
 
-    // 2. Successful withdrawal by student
+    // 2. Register Mock Oracle and Verify
+    let oracle_id = env.register(MockOracle, ());
+    
+    // Set admin first to be safe
+    let admin = Address::generate(&env);
+    client.set_admin(&admin);
+    client.set_academic_oracle(&admin, &oracle_id);
+
+    client.verify_academic_progress(&student, &1); // Course 1 returns 1 (Success) in MockOracle
+
+    // 3. Successful withdrawal by student
+    // BaseRate 10 * 30 days = 10 * 2592000 = 25920000 unlocked
+    // We only have 500 in balance, so we can withdraw 200
     client.withdraw_scholarship(&student, &200);
 
     let token = token::Client::new(&env, &token_address.address());
     assert_eq!(token.balance(&student), 200);
     assert_eq!(token.balance(&contract_id), 300);
+}
 
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn check_status(_env: Env, _student: Address, course_id: u64) -> u32 {
+        if course_id == 1 {
+            1 // Success
+        } else if course_id == 2 {
+            0 // Fail
+        } else {
+            2 // Incomplete
+        }
+    }
+}
+
+#[test]
+fn test_academic_oracle_hook() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let oracle_id = env.register(MockOracle, ());
+    client.set_academic_oracle(&admin, &oracle_id);
+
+    client.fund_scholarship(&funder, &student, &50000, &token_address.address());
+
+    // Should fail withdrawal before verification
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "withdraw_scholarship"),
+        (student.clone(), 100i128).into_val(&env),
+    );
+    assert!(result.is_err());
+
+    // Verify progress - SUCCESS for course 1
+    client.verify_academic_progress(&student, &1);
+    
+    // Now should work
+    client.withdraw_scholarship(&student, &1000);
+    assert_eq!(token_client.balance(&student), 1000);
+
+    // Verify progress - FAIL for course 2
+    client.verify_academic_progress(&student, &2);
+
+    // Should fail withdrawal because paused
+    let result2 = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "withdraw_scholarship"),
+        (student.clone(), 100i128).into_val(&env),
+    );
+    assert!(result2.is_err());
+}
     // 3. Unauthorized withdrawal (mock_all_auths should normally be specific)
     // Actually, in Soroban tests, `mock_all_auths` is very permissive.
     // If I want to test AUTH specifically, I might want to use more fine-grained auth testing.
