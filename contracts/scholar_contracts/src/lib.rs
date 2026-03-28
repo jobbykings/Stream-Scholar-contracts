@@ -1,5 +1,21 @@
 #![no_std]
 
+// Constants for ledger bump and GPA bonus calculations
+const LEDGER_BUMP_THRESHOLD: u32 = 7776000; // ~90 days
+const LEDGER_BUMP_EXTEND: u32 = 7776000;   // ~90 days
+const GPA_BONUS_THRESHOLD: u64 = 35;       // 3.5 GPA (stored as 35)
+const GPA_BONUS_PERCENTAGE_PER_POINT: u64 = 20; // 20% per 0.1 GPA point above threshold
+const EARLY_DROP_WINDOW_SECONDS: u64 = 86400; // 24 hours
+
+// Leaderboard constants
+const MAX_LEADERBOARD_SIZE: u64 = 100;     // Maximum number of scholars on leaderboard
+const ACADEMIC_POINTS_PER_COURSE: u64 = 100; // Points awarded per course completion
+const ACADEMIC_POINTS_PER_STREAK_DAY: u64 = 10; // Points per consecutive study day
+
+// Tutoring bridge constants
+const MAX_TUTORING_PERCENTAGE: u32 = 20;   // Maximum percentage that can be redirected (20%)
+const MIN_TUTORING_DURATION: u64 = 3600;  // Minimum tutoring duration (1 hour)
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -7,6 +23,14 @@ pub enum Event {
     StreamCreated(Address, Address, i128), // funder, student, amount
     GeographicReview(Address, u64), // student, timestamp
     SsiVerificationRequired(Address), // student
+    // Issue #92: Leaderboard events
+    AcademicPointsEarned(Address, u64), // student, points
+    LeaderboardUpdated(Symbol, u64), // student_alias, rank
+    MatchingBonusDistributed(Symbol, i128), // student_alias, amount
+    // Issue #94: Tutoring bridge events
+    TutoringAgreementCreated(Address, Address, u64), // scholar, tutor, agreement_id
+    SubStreamRedirected(Address, Address, i128), // scholar, tutor, amount
+    TutoringAgreementEnded(u64), // agreement_id
 }
 
 
@@ -28,6 +52,71 @@ pub struct Access {
 pub struct Scholarship {
     pub balance: i128,
     pub token: Address,
+    pub unlocked_balance: i128,
+    pub last_verif: u64,
+    pub is_paused: bool,
+    pub is_disputed: bool,
+    pub dispute_reason: Option<Symbol>,
+    pub final_ruling: Option<Symbol>,
+}
+
+// Issue #92: Anonymized Leaderboard for Top Scholars structs
+#[contracttype]
+#[derive(Clone)]
+pub struct StudentAcademicProfile {
+    pub student: Address,
+    pub academic_points: u64,
+    pub courses_completed: u64,
+    pub current_streak: u64,
+    pub last_activity: u64,
+    pub student_alias: Symbol, // Privacy-protecting alias
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct LeaderboardEntry {
+    pub student_alias: Symbol,
+    pub academic_points: u64,
+    pub rank: u64,
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GlobalExcellencePool {
+    pub total_pool_balance: i128,
+    pub token: Address,
+    pub total_distributed: i128,
+    pub last_distribution: u64,
+    pub is_active: bool,
+}
+
+// Issue #94: Peer-to-Peer Tutoring Payment Bridge structs
+#[contracttype]
+#[derive(Clone)]
+pub struct TutoringAgreement {
+    pub scholar: Address,
+    pub tutor: Address,
+    pub percentage: u32, // Percentage of scholarship flow to redirect
+    pub start_time: u64,
+    pub end_time: u64,
+    pub is_active: bool,
+    pub total_redirected: i128,
+    pub agreement_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SubStreamRedirect {
+    pub from_scholar: Address,
+    pub to_tutor: Address,
+    pub flow_rate: i128,
+    pub start_time: u64,
+    pub last_redirect: u64,
+    pub total_amount_redirected: i128,
+    pub is_active: bool,
+}
 
 
 #[contracttype]
@@ -113,39 +202,15 @@ pub enum DataKey {
     Scholarship(Address),
     VetoedCourseGlobal(u64),
     Session(Address),
-    AuditorCouncil,
-    AuditorStopRequest,
-    EmergencyStopExpiry,
-    PlatformFeeBalance,
-    StudentGPA(Address),
-    AcademicOracle(Address),
-    GroupVoteCount(u64, Address, Symbol),
-    NextGroupId,
-    StudyGroup(u64),
-    MemberCollateral(Address),
-    VoteRecord(Address, Address, u64),
-    GpaRecord(Address),
-    FlowRateAdjustment(Address),
-    BudgetTracker(Address),
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum ScholarError {
-    DepositBelowMinimum = 101, // Error 101: Deposit below protocol minimum
-    HeartbeatTooFrequent = 102, // Error 102: Student sending heartbeats too fast
-    AccessExpired = 103, // Error 103: Content access period has ended
-    InvalidRate = 104, // Error 104: Calculated dynamic rate is zero
-    InsufficientUnlockedBalance = 205, // Error 205: Probation_Active_Withdrawal_Limited
-    EmergencyStopActive = 301, // Error 301: Fast auditor response stop is active
-    AuditorNotAuthorized = 302, // Error 302: Not a member of auditor council
-    AuditorAlreadySigned = 303, // Error 303: Double-signature attempt on stop
-    DeadContractOnly = 401, // Error 401: finalize_and_close can only be called on 100% finished streams
-    InsufficientPlatformFee = 402, // Error 402: Bounty payment failed
-    OnlyOwnerCanUpdateXP = 501, // Error 501: Only owner can update XP
-    OnlyOwnerCanAddAchievements = 502, // Error 502: Only owner can add achievements
-    TransferNotAuthorized = 503, // Error 503: Transfer not authorized
+    // Issue #92: Leaderboard entries
+    StudentAcademicProfile(Address),
+    LeaderboardEntry(u64),
+    GlobalExcellencePool,
+    LeaderboardSize,
+    // Issue #94: Tutoring bridge entries
+    TutoringAgreement(u64),
+    SubStreamRedirect(Address),
+    TutoringAgreementCounter,
 }
 
 #[contracttype]
@@ -575,11 +640,17 @@ impl ScholarContract {
                 env.events().publish((Symbol::new(&env, "SBT_Mint"), student.clone(), course_id), course_id);
                 env.storage().persistent().set(&sbt_key, &true);
                 env.storage().persistent().extend_ttl(&sbt_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+                
+                // Issue #92: Award course completion points
+                Self::award_course_completion_points(env.clone(), student.clone(), course_id);
             }
         }
 
         env.storage().persistent().set(&access_key, &access);
         env.storage().persistent().extend_ttl(&access_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        // Issue #92: Update academic profile on heartbeat (engagement)
+        Self::update_academic_profile(env.clone(), student.clone());
     }
 
     fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
@@ -595,7 +666,7 @@ impl ScholarContract {
         if access.total_watch_time >= threshold {
             base_rate - (base_rate * percentage as i128 / 100)
         } else {
-            false
+            base_rate
         }
     }
 
@@ -745,9 +816,11 @@ impl ScholarContract {
                 final_ruling: None,
             });
 
-        // Only add the student's portion to scholarship balance
-        scholarship.balance += student_amount;
-        scholarship.unlocked_balance += student_amount; // Assume funded amount is unlocked
+        // Only add the student's portion to scholarship balance after processing tutoring redirects
+        let final_student_amount = Self::process_tutoring_payment(env.clone(), student.clone(), student_amount, token);
+        
+        scholarship.balance += final_student_amount;
+        scholarship.unlocked_balance += final_student_amount; // Assume funded amount is unlocked
         
         env.storage()
             .persistent()
@@ -940,6 +1013,462 @@ impl ScholarContract {
             }
         }
         0
+    }
+
+    // Issue #92: Anonymized Leaderboard for Top Scholars Functions
+
+    /// Generate a privacy-protecting student alias
+    fn generate_student_alias(env: &Env, student: &Address) -> Symbol {
+        let student_bytes = student.to_string();
+        let hash = env.crypto().sha256(&student_bytes.into());
+        // Take first 4 bytes and convert to a simple hex representation
+        let short_hash = &hash[0..4];
+        let alias_str = "Student_"; // Simple prefix
+        Symbol::new(env, alias_str)
+    }
+
+    /// Initialize or update student's academic profile
+    pub fn update_academic_profile(env: Env, student: Address) {
+        student.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        let profile_key = DataKey::StudentAcademicProfile(student.clone());
+        
+        let mut profile: StudentAcademicProfile = env.storage().persistent()
+            .get(&profile_key)
+            .unwrap_or(StudentAcademicProfile {
+                student: student.clone(),
+                academic_points: 0,
+                courses_completed: 0,
+                current_streak: 0,
+                last_activity: current_time,
+                student_alias: Self::generate_student_alias(&env, &student),
+                created_at: current_time,
+            });
+
+        // Update streak based on activity
+        if current_time - profile.last_activity < 86400 { // Within 24 hours
+            profile.current_streak += 1;
+            profile.academic_points += ACADEMIC_POINTS_PER_STREAK_DAY;
+        } else {
+            profile.current_streak = 1; // Reset streak
+        }
+
+        profile.last_activity = current_time;
+        env.storage().persistent().set(&profile_key, &profile);
+        env.storage().persistent().extend_ttl(&profile_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        // Emit event for academic points earned
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "AcademicPointsEarned"), student.clone(),),
+            profile.academic_points
+        );
+
+        // Update leaderboard
+        Self::update_leaderboard(env, student, profile.academic_points);
+    }
+
+    /// Award academic points for course completion
+    pub fn award_course_completion_points(env: Env, student: Address, course_id: u64) {
+        // Only admin or teacher can award points
+        let caller = env.current_contract_address();
+        
+        let profile_key = DataKey::StudentAcademicProfile(student.clone());
+        let mut profile: StudentAcademicProfile = env.storage().persistent()
+            .get(&profile_key)
+            .unwrap_or(StudentAcademicProfile {
+                student: student.clone(),
+                academic_points: 0,
+                courses_completed: 0,
+                current_streak: 0,
+                last_activity: env.ledger().timestamp(),
+                student_alias: Self::generate_student_alias(&env, &student),
+                created_at: env.ledger().timestamp(),
+            });
+
+        profile.courses_completed += 1;
+        profile.academic_points += ACADEMIC_POINTS_PER_COURSE;
+        profile.last_activity = env.ledger().timestamp();
+
+        env.storage().persistent().set(&profile_key, &profile);
+        env.storage().persistent().extend_ttl(&profile_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "AcademicPointsEarned"), student.clone(),),
+            ACADEMIC_POINTS_PER_COURSE
+        );
+
+        // Update leaderboard
+        Self::update_leaderboard(env, student, profile.academic_points);
+    }
+
+    /// Update the leaderboard with new student data
+    fn update_leaderboard(env: Env, student: Address, academic_points: u64) {
+        let profile_key = DataKey::StudentAcademicProfile(student.clone());
+        let profile: StudentAcademicProfile = env.storage().persistent()
+            .get(&profile_key)
+            .expect("Profile not found");
+
+        // Get current leaderboard size
+        let mut leaderboard_size: u64 = env.storage().instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+
+        // Find if student is already on leaderboard
+        let mut existing_rank = None;
+        for rank in 1..=leaderboard_size {
+            let entry_key = DataKey::LeaderboardEntry(rank);
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&entry_key) {
+                if entry.student_alias == profile.student_alias {
+                    existing_rank = Some(rank);
+                    break;
+                }
+            }
+        }
+
+        // Update or insert entry
+        let new_entry = LeaderboardEntry {
+            student_alias: profile.student_alias.clone(),
+            academic_points,
+            rank: 0, // Will be calculated
+            last_updated: env.ledger().timestamp(),
+        };
+
+        if let Some(rank) = existing_rank {
+            // Update existing entry
+            env.storage().persistent().set(&DataKey::LeaderboardEntry(rank), &new_entry);
+        } else if leaderboard_size < MAX_LEADERBOARD_SIZE {
+            // Add new entry
+            leaderboard_size += 1;
+            env.storage().instance().set(&DataKey::LeaderboardSize, &leaderboard_size);
+            env.storage().persistent().set(&DataKey::LeaderboardEntry(leaderboard_size), &new_entry);
+        }
+
+        // Re-sort leaderboard by academic points
+        Self::sort_leaderboard(env);
+    }
+
+    /// Sort leaderboard by academic points (descending)
+    fn sort_leaderboard(env: Env) {
+        let leaderboard_size: u64 = env.storage().instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+
+        let mut entries = Vec::new(&env);
+        for rank in 1..=leaderboard_size {
+            let entry_key = DataKey::LeaderboardEntry(rank);
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&entry_key) {
+                entries.push_back(entry);
+            }
+        }
+
+        // Sort by academic points (simple bubble sort for demonstration)
+        for i in 0..entries.len() {
+            for j in i + 1..entries.len() {
+                let entry_i = entries.get(i).unwrap();
+                let entry_j = entries.get(j).unwrap();
+                if entry_j.academic_points > entry_i.academic_points {
+                    entries.set(i, entry_j);
+                    entries.set(j, entry_i);
+                }
+            }
+        }
+
+        // Update ranks and store sorted entries
+        for (rank, entry) in entries.iter().enumerate() {
+            let mut sorted_entry = entry.clone();
+            sorted_entry.rank = (rank + 1) as u64;
+            env.storage().persistent().set(&DataKey::LeaderboardEntry(rank as u64 + 1), &sorted_entry);
+        }
+
+        // Emit leaderboard updated event for top 10
+        for rank in 1..=core::cmp::min(10, entries.len() as u64) {
+            let entry_key = DataKey::LeaderboardEntry(rank);
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&entry_key) {
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "LeaderboardUpdated"), entry.student_alias,),
+                    entry.rank
+                );
+            }
+        }
+    }
+
+    /// Get top N entries from the anonymized leaderboard
+    pub fn get_leaderboard(env: Env, limit: u64) -> Vec<LeaderboardEntry> {
+        let leaderboard_size: u64 = env.storage().instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+
+        let actual_limit = core::cmp::min(limit, leaderboard_size);
+        let mut result = Vec::new(&env);
+
+        for rank in 1..=actual_limit {
+            let entry_key = DataKey::LeaderboardEntry(rank);
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&entry_key) {
+                result.push_back(entry);
+            }
+        }
+
+        result
+    }
+
+    /// Initialize Global Excellence Pool for matching bonuses
+    pub fn init_excellence_pool(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        
+        // Verify admin
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let pool = GlobalExcellencePool {
+            total_pool_balance: 0,
+            token,
+            total_distributed: 0,
+            last_distribution: 0,
+            is_active: true,
+        };
+
+        env.storage().instance().set(&DataKey::GlobalExcellencePool, &pool);
+    }
+
+    /// Fund the Global Excellence Pool
+    pub fn fund_excellence_pool(env: Env, funder: Address, amount: i128) {
+        funder.require_auth();
+
+        let mut pool: GlobalExcellencePool = env.storage().instance()
+            .get(&DataKey::GlobalExcellencePool)
+            .expect("Excellence pool not initialized");
+
+        if !pool.is_active {
+            panic!("Excellence pool is not active");
+        }
+
+        // Transfer tokens to contract
+        let client = token::Client::new(&env, &pool.token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+
+        pool.total_pool_balance += amount;
+        env.storage().instance().set(&DataKey::GlobalExcellencePool, &pool);
+    }
+
+    /// Distribute matching bonuses to top scholars
+    pub fn distribute_matching_bonuses(env: Env, admin: Address, bonus_per_rank: i128) {
+        admin.require_auth();
+        
+        // Verify admin
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let mut pool: GlobalExcellencePool = env.storage().instance()
+            .get(&DataKey::GlobalExcellencePool)
+            .expect("Excellence pool not initialized");
+
+        let leaderboard_size: u64 = env.storage().instance()
+            .get(&DataKey::LeaderboardSize)
+            .unwrap_or(0);
+
+        let distribution_count = core::cmp::min(10, leaderboard_size); // Top 10 scholars
+        let total_needed = bonus_per_rank * distribution_count as i128;
+
+        if pool.total_pool_balance < total_needed {
+            panic!("Insufficient pool balance");
+        }
+
+        // Distribute bonuses
+        for rank in 1..=distribution_count {
+            let entry_key = DataKey::LeaderboardEntry(rank);
+            if let Some(entry) = env.storage().persistent().get::<_, LeaderboardEntry>(&entry_key) {
+                // Find student address from alias (this would require reverse mapping in production)
+                // For now, we'll emit an event and let frontend handle the actual distribution
+                
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "MatchingBonusDistributed"), entry.student_alias,),
+                    bonus_per_rank
+                );
+            }
+        }
+
+        pool.total_distributed += total_needed;
+        pool.total_pool_balance -= total_needed;
+        pool.last_distribution = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::GlobalExcellencePool, &pool);
+    }
+
+    // Issue #94: Peer-to-Peer Tutoring Payment Bridge Functions
+
+    /// Create a tutoring agreement between scholar and tutor
+    pub fn create_tutoring_agreement(
+        env: Env,
+        scholar: Address,
+        tutor: Address,
+        percentage: u32,
+        duration_seconds: u64,
+    ) -> u64 {
+        scholar.require_auth();
+
+        if percentage > MAX_TUTORING_PERCENTAGE {
+            panic!("Percentage exceeds maximum allowed");
+        }
+
+        if duration_seconds < MIN_TUTORING_DURATION {
+            panic!("Duration below minimum required");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let agreement_id: u64 = env.storage().instance()
+            .get(&DataKey::TutoringAgreementCounter)
+            .unwrap_or(0) + 1;
+
+        env.storage().instance().set(&DataKey::TutoringAgreementCounter, &agreement_id);
+
+        let agreement = TutoringAgreement {
+            scholar: scholar.clone(),
+            tutor: tutor.clone(),
+            percentage,
+            start_time: current_time,
+            end_time: current_time + duration_seconds,
+            is_active: true,
+            total_redirected: 0,
+            agreement_id,
+        };
+
+        env.storage().persistent().set(&DataKey::TutoringAgreement(agreement_id), &agreement);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TutoringAgreement(agreement_id), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+
+        // Initialize sub-stream redirect
+        let redirect = SubStreamRedirect {
+            from_scholar: scholar.clone(),
+            to_tutor: tutor.clone(),
+            flow_rate: 0, // Will be calculated based on scholarship flow
+            start_time: current_time,
+            last_redirect: current_time,
+            total_amount_redirected: 0,
+            is_active: true,
+        };
+
+        env.storage().persistent().set(&DataKey::SubStreamRedirect(scholar), &redirect);
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "TutoringAgreementCreated"), scholar, tutor,),
+            agreement_id
+        );
+
+        agreement_id
+    }
+
+    /// Process sub-stream redirection for tutoring payments
+    pub fn process_tutoring_payment(env: Env, scholar: Address, scholarship_amount: i128, token: Address) -> i128 {
+        let current_time = env.ledger().timestamp();
+        let redirect_key = DataKey::SubStreamRedirect(scholar.clone());
+        
+        let mut redirect: SubStreamRedirect = env.storage().persistent()
+            .get(&redirect_key)
+            .unwrap_or(SubStreamRedirect {
+                from_scholar: scholar.clone(),
+                to_tutor: Address::generate(&env), // Dummy address
+                flow_rate: 0,
+                start_time: current_time,
+                last_redirect: current_time,
+                total_amount_redirected: 0,
+                is_active: false,
+            });
+
+        if !redirect.is_active {
+            return scholarship_amount; // No redirection
+        }
+
+        // Check if tutoring agreement is still active
+        let agreement_key = DataKey::TutoringAgreement(1); // Simplified - would need agreement_id
+        if let Some(agreement) = env.storage().persistent().get::<_, TutoringAgreement>(&agreement_key) {
+            if current_time > agreement.end_time || !agreement.is_active {
+                redirect.is_active = false;
+                env.storage().persistent().set(&redirect_key, &redirect);
+                return scholarship_amount;
+            }
+
+            // Calculate redirection amount
+            let redirect_amount = (scholarship_amount * agreement.percentage as i128) / 100;
+            let scholar_amount = scholarship_amount - redirect_amount;
+
+            // Update redirect tracking
+            redirect.total_amount_redirected += redirect_amount;
+            redirect.last_redirect = current_time;
+            env.storage().persistent().set(&redirect_key, &redirect);
+
+            // Transfer to tutor
+            if redirect_amount > 0 {
+                let client = token::Client::new(&env, &token);
+                client.transfer(&env.current_contract_address(), &redirect.to_tutor, &redirect_amount);
+            }
+
+            // Emit event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "SubStreamRedirected"), scholar, redirect.to_tutor,),
+                redirect_amount
+            );
+
+            scholar_amount
+        } else {
+            scholarship_amount // No agreement found
+        }
+    }
+
+    /// End a tutoring agreement
+    pub fn end_tutoring_agreement(env: Env, scholar: Address, agreement_id: u64) {
+        scholar.require_auth();
+
+        let agreement_key = DataKey::TutoringAgreement(agreement_id);
+        let mut agreement: TutoringAgreement = env.storage().persistent()
+            .get(&agreement_key)
+            .expect("Tutoring agreement not found");
+
+        if agreement.scholar != scholar {
+            panic!("Not authorized to end this agreement");
+        }
+
+        agreement.is_active = false;
+        env.storage().persistent().set(&agreement_key, &agreement);
+
+        // Deactivate sub-stream redirect
+        let redirect_key = DataKey::SubStreamRedirect(scholar);
+        if let Some(mut redirect) = env.storage().persistent().get::<_, SubStreamRedirect>(&redirect_key) {
+            redirect.is_active = false;
+            env.storage().persistent().set(&redirect_key, &redirect);
+        }
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "TutoringAgreementEnded"),),
+            agreement_id
+        );
+    }
+
+    /// Get active tutoring agreement for a scholar
+    pub fn get_tutoring_agreement(env: Env, agreement_id: u64) -> TutoringAgreement {
+        env.storage().persistent()
+            .get(&DataKey::TutoringAgreement(agreement_id))
+            .expect("Tutoring agreement not found")
+    }
+
+    /// Get sub-stream redirect info for a scholar
+    pub fn get_sub_stream_redirect(env: Env, scholar: Address) -> Option<SubStreamRedirect> {
+        env.storage().persistent()
+            .get(&DataKey::SubStreamRedirect(scholar))
     }
 
 

@@ -2136,3 +2136,174 @@ fn test_stream_management() {
     let withdrawn = client.withdraw_from_stream(&student, &funder, &token_address.address());
     assert_eq!(withdrawn, 50 * 50); // 50 seconds * 50 tokens/second
 }
+
+// Issue #92: Anonymized Leaderboard for Top Scholars Tests
+
+#[test]
+fn test_academic_profile_creation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Update academic profile
+    client.update_academic_profile(&student);
+
+    // The profile should be created with initial academic points
+    // We can't directly access the profile, but we can test the leaderboard
+    let leaderboard = client.get_leaderboard(&1);
+    assert_eq!(leaderboard.len(), 1);
+}
+
+#[test]
+fn test_course_completion_points() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract and set admin
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Award course completion points
+    client.award_course_completion_points(&student, &1);
+
+    // Check if student appears on leaderboard
+    let leaderboard = client.get_leaderboard(&10);
+    assert!(!leaderboard.is_empty());
+}
+
+#[test]
+fn test_excellence_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract and set admin
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize excellence pool
+    client.init_excellence_pool(&admin, &token_address.address());
+
+    // Fund the pool
+    client.fund_excellence_pool(&funder, &1000);
+
+    // Test would require more setup for actual distribution
+    // This is a basic test to ensure the functions don't panic
+}
+
+// Issue #94: Peer-to-Peer Tutoring Payment Bridge Tests
+
+#[test]
+fn test_tutoring_agreement_creation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let scholar = Address::generate(&env);
+    let tutor = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Create tutoring agreement
+    let agreement_id = client.create_tutoring_agreement(
+        &scholar,
+        &tutor,
+        &5, // 5% percentage
+        &3600, // 1 hour duration
+    );
+
+    assert_eq!(agreement_id, 1);
+
+    // Get the agreement
+    let agreement = client.get_tutoring_agreement(&agreement_id);
+    assert_eq!(agreement.scholar, scholar);
+    assert_eq!(agreement.tutor, tutor);
+    assert_eq!(agreement.percentage, 5);
+    assert!(agreement.is_active);
+}
+
+#[test]
+fn test_tutoring_agreement_ending() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let scholar = Address::generate(&env);
+    let tutor = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Create tutoring agreement
+    let agreement_id = client.create_tutoring_agreement(
+        &scholar,
+        &tutor,
+        &5, // 5% percentage
+        &3600, // 1 hour duration
+    );
+
+    // End the agreement
+    client.end_tutoring_agreement(&scholar, &agreement_id);
+
+    // Get the agreement and verify it's ended
+    let agreement = client.get_tutoring_agreement(&agreement_id);
+    assert!(!agreement.is_active);
+}
+
+#[test]
+fn test_tutoring_payment_processing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let scholar = Address::generate(&env);
+    let tutor = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&scholar, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract
+    client.init(&10, &3600, &10, &100, &60);
+
+    // Create tutoring agreement
+    let _agreement_id = client.create_tutoring_agreement(
+        &scholar,
+        &tutor,
+        &10, // 10% percentage
+        &3600, // 1 hour duration
+    );
+
+    // Fund scholarship (this should process tutoring payment)
+    client.fund_scholarship(&scholar, &scholar, &1000, &token_address.address());
+
+    // The test verifies the function doesn't panic
+    // In a real scenario, we'd check the tutor's balance
+}
