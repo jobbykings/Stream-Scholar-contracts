@@ -16,6 +16,15 @@ const ACADEMIC_POINTS_PER_STREAK_DAY: u64 = 10; // Points per consecutive study 
 const MAX_TUTORING_PERCENTAGE: u32 = 20;   // Maximum percentage that can be redirected (20%)
 const MIN_TUTORING_DURATION: u64 = 3600;  // Minimum tutoring duration (1 hour)
 
+// Alumni Donation Matching Incentive constants (#95)
+const ALUMNI_MATCHING_MULTIPLIER: u64 = 2; // 2:1 matching ratio
+const GRADUATION_SBT_COURSE_ID: u64 = 9999; // Special course ID for graduation SBT
+
+// Scholarship Probation Cooling-Off Logic constants (#93)
+const PROBATION_WARNING_PERIOD: u64 = 5184000; // 60 days in seconds
+const PROBATION_FLOW_REDUCTION: u64 = 30; // 30% reduction
+const GPA_THRESHOLD: u64 = 25; // 2.5 GPA threshold (stored as 25)
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -31,6 +40,12 @@ pub enum Event {
     TutoringAgreementCreated(Address, Address, u64), // scholar, tutor, agreement_id
     SubStreamRedirected(Address, Address, i128), // scholar, tutor, amount
     TutoringAgreementEnded(u64), // agreement_id
+    // Issue #95: Alumni Donation Matching events
+    AlumniDonationMatched(Address, i128, i128), // donor, original_amount, matched_amount
+    // Issue #93: Scholarship Probation Cooling-Off events
+    ProbationStarted(Address, u64), // student, warning_period_end
+    ProbationEnded(Address, bool), // student, recovered
+    StreamRevoked(Address), // student
 }
 
 
@@ -117,6 +132,62 @@ pub struct SubStreamRedirect {
     pub is_active: bool,
 }
 
+// Issue #95: Alumni Donation Matching Incentive structs
+#[contracttype]
+#[derive(Clone)]
+pub struct GraduationSBT {
+    pub student: Address,
+    pub graduation_date: u64,
+    pub gpa: u64, // Final GPA at graduation
+    pub is_verified: bool,
+    pub token_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AlumniDonation {
+    pub donor: Address,
+    pub original_amount: i128,
+    pub matched_amount: i128,
+    pub scholarship_pool: u64, // Target scholarship pool ID
+    pub donation_date: u64,
+    pub has_graduation_sbt: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GeneralExcellenceFund {
+    pub total_balance: i128,
+    pub token: Address,
+    pub total_matched: i128,
+    pub is_active: bool,
+    pub last_updated: u64,
+}
+
+// Issue #93: Scholarship Probation Cooling-Off Logic structs
+#[contracttype]
+#[derive(Clone)]
+pub struct ProbationStatus {
+    pub student: Address,
+    pub is_on_probation: bool,
+    pub probation_start_time: u64,
+    pub warning_period_end: u64,
+    pub original_flow_rate: i128,
+    pub reduced_flow_rate: i128,
+    pub violation_count: u32, // Number of GPA drops below threshold
+    pub last_gpa_check: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GPAUpdate {
+    pub student: Address,
+    pub new_gpa: u64,
+    pub previous_gpa: u64,
+    pub update_timestamp: u64,
+    pub oracle_verified: bool,
+}
+
 
 #[contracttype]
 pub enum DataKey {
@@ -144,6 +215,14 @@ pub enum DataKey {
     TutoringAgreement(u64),
     SubStreamRedirect(Address),
     TutoringAgreementCounter,
+    // Issue #95: Alumni Donation Matching entries
+    GraduationSBT(Address),
+    AlumniDonation(u64), // donation_id
+    AlumniDonationCounter,
+    GeneralExcellenceFund,
+    // Issue #93: Scholarship Probation Cooling-Off entries
+    ProbationStatus(Address),
+    GPAUpdate(Address),
 }
 
 #[contracttype]
@@ -1381,6 +1460,409 @@ impl ScholarContract {
     pub fn get_sub_stream_redirect(env: Env, scholar: Address) -> Option<SubStreamRedirect> {
         env.storage().persistent()
             .get(&DataKey::SubStreamRedirect(scholar))
+    }
+
+    // Issue #95: Alumni Donation Matching Incentive Functions
+
+    /// Initialize General Excellence Fund for alumni matching
+    pub fn init_general_excellence_fund(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        
+        // Verify admin
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let fund = GeneralExcellenceFund {
+            total_balance: 0,
+            token,
+            total_matched: 0,
+            is_active: true,
+            last_updated: env.ledger().timestamp(),
+        };
+
+        env.storage().instance().set(&DataKey::GeneralExcellenceFund, &fund);
+    }
+
+    /// Fund the General Excellence Fund
+    pub fn fund_general_excellence_fund(env: Env, funder: Address, amount: i128) {
+        funder.require_auth();
+
+        let mut fund: GeneralExcellenceFund = env.storage().instance()
+            .get(&DataKey::GeneralExcellenceFund)
+            .expect("General Excellence Fund not initialized");
+
+        if !fund.is_active {
+            panic!("General Excellence Fund is not active");
+        }
+
+        // Transfer tokens to contract
+        let client = token::Client::new(&env, &fund.token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+
+        fund.total_balance += amount;
+        fund.last_updated = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::GeneralExcellenceFund, &fund);
+    }
+
+    /// Issue Graduation SBT to a student
+    pub fn issue_graduation_sbt(env: Env, admin: Address, student: Address, final_gpa: u64) -> u64 {
+        admin.require_auth();
+        
+        // Verify admin
+        if !Self::is_admin(&env, &admin) {
+            panic!("Not authorized");
+        }
+
+        let current_time = env.ledger().timestamp();
+        let token_id: u64 = env.storage().instance()
+            .get(&DataKey::AlumniDonationCounter)
+            .unwrap_or(0) + 1;
+
+        env.storage().instance().set(&DataKey::AlumniDonationCounter, &token_id);
+
+        let graduation_sbt = GraduationSBT {
+            student: student.clone(),
+            graduation_date: current_time,
+            gpa: final_gpa,
+            is_verified: true,
+            token_id,
+        };
+
+        env.storage().persistent().set(&DataKey::GraduationSBT(student), &graduation_sbt);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GraduationSBT(student), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+
+        // Mark graduation SBT as minted
+        let sbt_key = DataKey::SbtMinted(student.clone(), GRADUATION_SBT_COURSE_ID);
+        env.storage().persistent().set(&sbt_key, &true);
+        env.storage().persistent().extend_ttl(&sbt_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "SbtMint"), student, GRADUATION_SBT_COURSE_ID),
+            token_id
+        );
+
+        token_id
+    }
+
+    /// Check if a donor has Graduation SBT (is an alumnus)
+    fn has_graduation_sbt(env: &Env, donor: &Address) -> bool {
+        let sbt_key = DataKey::SbtMinted(donor.clone(), GRADUATION_SBT_COURSE_ID);
+        env.storage().persistent().get(&sbt_key).unwrap_or(false)
+    }
+
+    /// Process alumni donation with matching
+    pub fn process_alumni_donation(
+        env: Env,
+        donor: Address,
+        amount: i128,
+        scholarship_pool: u64,
+        token: Address,
+    ) -> (i128, i128) {
+        donor.require_auth();
+
+        let current_time = env.ledger().timestamp();
+        let donation_id: u64 = env.storage().instance()
+            .get(&DataKey::AlumniDonationCounter)
+            .unwrap_or(0) + 1;
+
+        env.storage().instance().set(&DataKey::AlumniDonationCounter, &donation_id);
+
+        // Check if donor has Graduation SBT
+        let has_sbt = Self::has_graduation_sbt(&env, &donor);
+        
+        let mut matched_amount = 0i128;
+        let total_deduction = if has_sbt {
+            // Calculate 2:1 match
+            matched_amount = amount * ALUMNI_MATCHING_MULTIPLIER as i128;
+            amount + matched_amount
+        } else {
+            amount
+        };
+
+        // Transfer original donation from donor
+        let client = token::Client::new(&env, &token);
+        client.transfer(&donor, &env.current_contract_address(), &amount);
+
+        // If matching applies, transfer from General Excellence Fund
+        if has_sbt && matched_amount > 0 {
+            let mut fund: GeneralExcellenceFund = env.storage().instance()
+                .get(&DataKey::GeneralExcellenceFund)
+                .expect("General Excellence Fund not initialized");
+
+            if fund.total_balance < matched_amount {
+                panic!("Insufficient balance in General Excellence Fund for matching");
+            }
+
+            fund.total_balance -= matched_amount;
+            fund.total_matched += matched_amount;
+            fund.last_updated = current_time;
+            env.storage().instance().set(&DataKey::GeneralExcellenceFund, &fund);
+        }
+
+        // Create donation record
+        let donation = AlumniDonation {
+            donor: donor.clone(),
+            original_amount: amount,
+            matched_amount,
+            scholarship_pool,
+            donation_date: current_time,
+            has_graduation_sbt: has_sbt,
+        };
+
+        env.storage().persistent().set(&DataKey::AlumniDonation(donation_id), &donation);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AlumniDonation(donation_id), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "AlumniDonationMatched"), donor,),
+            (amount, matched_amount)
+        );
+
+        (amount, matched_amount)
+    }
+
+    /// Get graduation SBT info for a student
+    pub fn get_graduation_sbt(env: Env, student: Address) -> Option<GraduationSBT> {
+        env.storage().persistent()
+            .get(&DataKey::GraduationSBT(student))
+    }
+
+    /// Get alumni donation info
+    pub fn get_alumni_donation(env: Env, donation_id: u64) -> Option<AlumniDonation> {
+        env.storage().persistent()
+            .get(&DataKey::AlumniDonation(donation_id))
+    }
+
+    /// Get General Excellence Fund info
+    pub fn get_general_excellence_fund(env: Env) -> Option<GeneralExcellenceFund> {
+        env.storage().instance()
+            .get(&DataKey::GeneralExcellenceFund)
+    }
+
+    // Issue #93: Scholarship Probation Cooling-Off Logic Functions
+
+    /// Update student GPA and handle probation logic
+    pub fn update_student_gpa(env: Env, oracle: Address, student: Address, new_gpa: u64) {
+        oracle.require_auth();
+        
+        let current_time = env.ledger().timestamp();
+        
+        // Get previous GPA for tracking
+        let previous_gpa: u64 = if let Some(gpa_data) = env.storage().persistent()
+            .get::<_, StudentGPA>(&DataKey::StudentGPA(student.clone())) {
+            gpa_data.gpa
+        } else {
+            0 // No previous GPA
+        };
+
+        // Create GPA update record
+        let gpa_update = GPAUpdate {
+            student: student.clone(),
+            new_gpa,
+            previous_gpa,
+            update_timestamp: current_time,
+            oracle_verified: true,
+        };
+
+        env.storage().persistent().set(&DataKey::GPAUpdate(student.clone()), &gpa_update);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GPAUpdate(student), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+
+        // Update StudentGPA record
+        let student_gpa = StudentGPA {
+            student: student.clone(),
+            gpa: new_gpa,
+            last_updated: current_time,
+            oracle_verified: true,
+        };
+
+        env.storage().persistent().set(&DataKey::StudentGPA(student.clone()), &student_gpa);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StudentGPA(student), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+
+        // Handle probation logic
+        Self::handle_probation_logic(env.clone(), student.clone(), new_gpa, current_time);
+    }
+
+    /// Handle probation logic based on GPA updates
+    fn handle_probation_logic(env: Env, student: Address, new_gpa: u64, current_time: u64) {
+        let mut probation_status: ProbationStatus = env.storage().persistent()
+            .get(&DataKey::ProbationStatus(student.clone()))
+            .unwrap_or(ProbationStatus {
+                student: student.clone(),
+                is_on_probation: false,
+                probation_start_time: 0,
+                warning_period_end: 0,
+                original_flow_rate: 0,
+                reduced_flow_rate: 0,
+                violation_count: 0,
+                last_gpa_check: 0,
+            });
+
+        // Check if GPA is below threshold
+        if new_gpa < GPA_THRESHOLD {
+            if !probation_status.is_on_probation {
+                // First violation - start probation
+                Self::start_probation(env.clone(), student.clone(), &mut probation_status, current_time);
+            } else {
+                // Already on probation - check if warning period has ended
+                if current_time > probation_status.warning_period_end {
+                    // Warning period ended and GPA still low - revoke scholarship
+                    Self::revoke_scholarship(env.clone(), student.clone());
+                } else {
+                    // Still in warning period but GPA dropped again - extend violation tracking
+                    probation_status.violation_count += 1;
+                    probation_status.last_gpa_check = current_time;
+                }
+            }
+        } else {
+            // GPA is acceptable
+            if probation_status.is_on_probation {
+                // Student recovered - end probation
+                Self::end_probation(env.clone(), student.clone(), &mut probation_status, true);
+            }
+        }
+
+        // Update probation status
+        probation_status.last_gpa_check = current_time;
+        env.storage().persistent().set(&DataKey::ProbationStatus(student), &probation_status);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProbationStatus(student), 
+            LEDGER_BUMP_THRESHOLD, 
+            LEDGER_BUMP_EXTEND
+        );
+    }
+
+    /// Start probation for a student
+    fn start_probation(env: Env, student: Address, probation_status: &mut ProbationStatus, current_time: u64) {
+        // Get current scholarship to calculate flow rate reduction
+        if let Some(mut scholarship) = env.storage().persistent()
+            .get::<_, Scholarship>(&DataKey::Scholarship(student.clone())) {
+            
+            // Calculate reduced flow rate (30% reduction)
+            let original_rate = scholarship.balance; // Simplified - in real implementation, this would be flow rate
+            let reduction_amount = (original_rate * PROBATION_FLOW_REDUCTION as i128) / 100;
+            let reduced_rate = original_rate - reduction_amount;
+
+            // Update probation status
+            probation_status.is_on_probation = true;
+            probation_status.probation_start_time = current_time;
+            probation_status.warning_period_end = current_time + PROBATION_WARNING_PERIOD;
+            probation_status.original_flow_rate = original_rate;
+            probation_status.reduced_flow_rate = reduced_rate;
+            probation_status.violation_count = 1;
+            probation_status.last_gpa_check = current_time;
+
+            // Apply reduction to scholarship (simplified - would affect flow rate in real implementation)
+            scholarship.balance = reduced_rate;
+
+            env.storage().persistent().set(&DataKey::Scholarship(student), &scholarship);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Scholarship(student), 
+                LEDGER_BUMP_THRESHOLD, 
+                LEDGER_BUMP_EXTEND
+            );
+
+            // Emit event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "ProbationStarted"), student,),
+                probation_status.warning_period_end
+            );
+        }
+    }
+
+    /// End probation for a student
+    fn end_probation(env: Env, student: Address, probation_status: &mut ProbationStatus, recovered: bool) {
+        let current_time = env.ledger().timestamp();
+        
+        // Restore original flow rate
+        if let Some(mut scholarship) = env.storage().persistent()
+            .get::<_, Scholarship>(&DataKey::Scholarship(student.clone())) {
+            
+            scholarship.balance = probation_status.original_flow_rate;
+            
+            env.storage().persistent().set(&DataKey::Scholarship(student), &scholarship);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Scholarship(student), 
+                LEDGER_BUMP_THRESHOLD, 
+                LEDGER_BUMP_EXTEND
+            );
+        }
+
+        // Reset probation status
+        probation_status.is_on_probation = false;
+        probation_status.probation_start_time = 0;
+        probation_status.warning_period_end = 0;
+        probation_status.original_flow_rate = 0;
+        probation_status.reduced_flow_rate = 0;
+        probation_status.violation_count = 0;
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "ProbationEnded"), student,),
+            recovered
+        );
+    }
+
+    /// Revoke scholarship permanently
+    fn revoke_scholarship(env: Env, student: Address) {
+        // Mark scholarship as disputed with revocation reason
+        if let Some(mut scholarship) = env.storage().persistent()
+            .get::<_, Scholarship>(&DataKey::Scholarship(student.clone())) {
+            
+            scholarship.is_disputed = true;
+            scholarship.dispute_reason = Some(Symbol::new(&env, "PERMANENT_REVOCATION_GPA"));
+            scholarship.final_ruling = Some(Symbol::new(&env, "REVOKED"));
+            
+            env.storage().persistent().set(&DataKey::Scholarship(student), &scholarship);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Scholarship(student), 
+                LEDGER_BUMP_THRESHOLD, 
+                LEDGER_BUMP_EXTEND
+            );
+        }
+
+        // Clear probation status
+        env.storage().persistent().remove(&DataKey::ProbationStatus(student.clone()));
+
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "StreamRevoked"), student,),
+            ()
+        );
+    }
+
+    /// Get probation status for a student
+    pub fn get_probation_status(env: Env, student: Address) -> Option<ProbationStatus> {
+        env.storage().persistent()
+            .get(&DataKey::ProbationStatus(student))
+    }
+
+    /// Get GPA update info for a student
+    pub fn get_gpa_update(env: Env, student: Address) -> Option<GPAUpdate> {
+        env.storage().persistent()
+            .get(&DataKey::GPAUpdate(student))
     }
 
 
