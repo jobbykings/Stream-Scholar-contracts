@@ -1,4 +1,4 @@
-const { TransactionBuilder, Networks, Operation, Asset, Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { TransactionBuilder, Networks, Operation, Asset, Keypair, StrKey, Server } = require('@stellar/stellar-sdk');
 
 /**
  * Student Profile NFT Contract for Stellar
@@ -9,7 +9,7 @@ class StudentProfileNFT {
     constructor(networkPassphrase, horizonUrl) {
         this.networkPassphrase = networkPassphrase || Networks.TESTNET;
         this.horizonUrl = horizonUrl || 'https://horizon-testnet.stellar.org';
-        this.server = new StellarSdk.Server(this.horizonUrl);
+        this.server = new Server(this.horizonUrl);
         
         // Contract configuration
         this.contractCode = this.generateContractCode();

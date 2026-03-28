@@ -828,3 +828,4 @@ impl ScholarContract {
 
 mod test;
 mod tuition_stipend_split_tests;
+mod student_profile_nft;

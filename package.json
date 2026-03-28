@@ -5,10 +5,14 @@
   "main": "src/index.js",
   "scripts": {
     "test": "jest",
+    "test:nft": "jest tests/nft-integration.test.js",
     "build": "webpack --mode production",
     "dev": "webpack serve --mode development",
     "deploy": "node scripts/deploy.js",
-    "mint": "node scripts/mint-nft.js"
+    "deploy:nft": "node scripts/deploy-nft.js",
+    "mint": "node scripts/mint-nft.js",
+    "mint:enhanced": "node scripts/mint-nft-enhanced.js",
+    "mint:demo": "node scripts/mint-nft-enhanced.js demo"
   },
   "keywords": [
     "stellar",
