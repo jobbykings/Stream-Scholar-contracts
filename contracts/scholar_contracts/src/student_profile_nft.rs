@@ -1,5 +1,6 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec, String, Map, BytesN};
+use crate::ScholarError;
 
 // Student Profile NFT Contract for Soroban
 // Implements dynamic NFTs that evolve with student achievements
@@ -137,7 +138,7 @@ impl StudentProfileNFTContract {
 
         // Verify caller is owner
         if nft.owner != caller {
-            panic!("Only owner can update XP");
+            env.panic_with_error(ScholarError::OnlyOwnerCanUpdateXP);
         }
 
         let old_level = nft.level;
@@ -189,7 +190,7 @@ impl StudentProfileNFTContract {
 
         // Verify caller is owner
         if nft.owner != caller {
-            panic!("Only owner can add achievements");
+            env.panic_with_error(ScholarError::OnlyOwnerCanAddAchievements);
         }
 
         // Store achievement
@@ -227,7 +228,7 @@ impl StudentProfileNFTContract {
 
         // Verify from address is current owner
         if nft.owner != from {
-            panic!("Transfer not authorized");
+            env.panic_with_error(ScholarError::TransferNotAuthorized);
         }
 
         // Update ownership

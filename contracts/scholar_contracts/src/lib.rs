@@ -113,7 +113,39 @@ pub enum DataKey {
     Scholarship(Address),
     VetoedCourseGlobal(u64),
     Session(Address),
+    AuditorCouncil,
+    AuditorStopRequest,
+    EmergencyStopExpiry,
+    PlatformFeeBalance,
+    StudentGPA(Address),
+    AcademicOracle(Address),
+    GroupVoteCount(u64, Address, Symbol),
+    NextGroupId,
+    StudyGroup(u64),
+    MemberCollateral(Address),
+    VoteRecord(Address, Address, u64),
+    GpaRecord(Address),
+    FlowRateAdjustment(Address),
+    BudgetTracker(Address),
+}
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ScholarError {
+    DepositBelowMinimum = 101, // Error 101: Deposit below protocol minimum
+    HeartbeatTooFrequent = 102, // Error 102: Student sending heartbeats too fast
+    AccessExpired = 103, // Error 103: Content access period has ended
+    InvalidRate = 104, // Error 104: Calculated dynamic rate is zero
+    InsufficientUnlockedBalance = 205, // Error 205: Probation_Active_Withdrawal_Limited
+    EmergencyStopActive = 301, // Error 301: Fast auditor response stop is active
+    AuditorNotAuthorized = 302, // Error 302: Not a member of auditor council
+    AuditorAlreadySigned = 303, // Error 303: Double-signature attempt on stop
+    DeadContractOnly = 401, // Error 401: finalize_and_close can only be called on 100% finished streams
+    InsufficientPlatformFee = 402, // Error 402: Bounty payment failed
+    OnlyOwnerCanUpdateXP = 501, // Error 501: Only owner can update XP
+    OnlyOwnerCanAddAchievements = 502, // Error 502: Only owner can add achievements
+    TransferNotAuthorized = 503, // Error 503: Transfer not authorized
 }
 
 #[contracttype]
@@ -182,6 +214,22 @@ pub struct BoardPauseRequest {
     pub signatures: Vec<Address>,
     pub is_executed: bool,
     pub executed_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditorCouncil {
+    pub members: Vec<Address>,
+    pub required_signatures: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditorStopRequest {
+    pub reason: Symbol,
+    pub requested_at: u64,
+    pub signatures: Vec<Address>,
+    pub is_executed: bool,
 }
 
 // Research Grant Milestone Escrow structs
@@ -324,6 +372,9 @@ pub struct VouchRecord {
 #[contract]
 pub struct ScholarContract;
 
+const EMERGENCY_STOP_DURATION: u64 = 7 * 24 * 60 * 60; // 7 Days
+const CLEANUP_BOUNTY_PERCENT: u32 = 5; // 5% of platform fee
+
 #[contractimpl]
 impl ScholarContract {
     pub fn init(
@@ -419,11 +470,12 @@ impl ScholarContract {
     }
 
     pub fn buy_access(env: Env, student: Address, course_id: u64, amount: i128, token: Address) {
+        Self::check_emergency_stop(&env);
         student.require_auth();
 
         let min_deposit: i128 = env.storage().instance().get(&DataKey::MinDeposit).unwrap_or(0);
         if amount < min_deposit {
-            panic!("Deposit below minimum");
+            env.panic_with_error(ScholarError::DepositBelowMinimum);
         }
 
         if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
@@ -431,7 +483,7 @@ impl ScholarContract {
         }
 
         let rate = Self::calculate_dynamic_rate(env.clone(), student.clone(), course_id);
-        if rate <= 0 { panic!("Invalid rate"); }
+        if rate <= 0 { env.panic_with_error(ScholarError::InvalidRate); }
 
         let seconds_bought = u64::try_from(amount / rate).expect("Overflow");
         let actual_cost = (seconds_bought as i128) * rate;
@@ -491,6 +543,7 @@ impl ScholarContract {
     }
 
     pub fn heartbeat(env: Env, student: Address, course_id: u64, _signature: soroban_sdk::Bytes) {
+        Self::check_emergency_stop(&env);
         student.require_auth();
         let current_time = env.ledger().timestamp();
         let access_key = DataKey::Access(student.clone(), course_id);
@@ -499,11 +552,11 @@ impl ScholarContract {
         let interval: u64 = env.storage().instance().get(&DataKey::HeartbeatInterval).unwrap_or(60);
 
         if access.last_heartbeat > 0 && (current_time - access.last_heartbeat) < interval {
-            panic!("Heartbeat too frequent");
+            env.panic_with_error(ScholarError::HeartbeatTooFrequent);
         }
 
         if current_time >= access.expiry_time {
-            panic!("Access expired");
+            env.panic_with_error(ScholarError::AccessExpired);
         }
 
         if access.last_heartbeat > 0 {
@@ -744,7 +797,7 @@ impl ScholarContract {
         }
 
         if scholarship.unlocked_balance < amount {
-            panic!("Insufficient unlocked balance. Need academic verification?");
+            env.panic_with_error(ScholarError::InsufficientUnlockedBalance);
         }
 
         if scholarship.balance < amount {
@@ -1356,6 +1409,7 @@ impl ScholarContract {
     }
     
     pub fn withdraw_with_math_verification(env: Env, student: Address, funder: Address, token: Address) -> i128 {
+        Self::check_emergency_stop(&env);
         student.require_auth();
         
         // First verify the budget invariant
@@ -1453,6 +1507,115 @@ impl ScholarContract {
     
     pub fn get_gpa_info(env: Env, student: Address) -> Option<GpaRecord> {
         env.storage().persistent().get(&DataKey::GpaRecord(student))
+    }
+
+    // --- Task #100: Admin_Emergency_Stop_for_Auditors ---
+
+    pub fn init_auditors(env: Env, admin: Address, auditors: Vec<Address>) {
+        admin.require_auth();
+        if !Self::is_admin(&env, &admin) {
+            env.panic_with_error(soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction);
+        }
+        
+        let council = AuditorCouncil {
+            members: auditors,
+            required_signatures: 2, // 2-of-3 logic
+        };
+        env.storage().instance().set(&DataKey::AuditorCouncil, &council);
+    }
+
+    pub fn auditor_stop_request(env: Env, auditor: Address, reason: Symbol) {
+        auditor.require_auth();
+        let council: AuditorCouncil = env.storage().instance().get(&DataKey::AuditorCouncil).expect("Auditors not set");
+        
+        if !council.members.contains(&auditor) {
+            env.panic_with_error(ScholarError::AuditorNotAuthorized);
+        }
+
+        let request = AuditorStopRequest {
+            reason,
+            requested_at: env.ledger().timestamp(),
+            signatures: Vec::from_array(&env, [auditor]),
+            is_executed: false,
+        };
+        env.storage().instance().set(&DataKey::AuditorStopRequest, &request);
+    }
+
+    pub fn auditor_stop_sign(env: Env, auditor: Address) {
+        auditor.require_auth();
+        let council: AuditorCouncil = env.storage().instance().get(&DataKey::AuditorCouncil).expect("Auditors not set");
+        let mut request: AuditorStopRequest = env.storage().instance().get(&DataKey::AuditorStopRequest).expect("No stop request");
+
+        if !council.members.contains(&auditor) {
+            env.panic_with_error(ScholarError::AuditorNotAuthorized);
+        }
+
+        if request.signatures.contains(&auditor) {
+            env.panic_with_error(ScholarError::AuditorAlreadySigned);
+        }
+
+        request.signatures.push_back(auditor);
+
+        if request.signatures.len() >= council.required_signatures && !request.is_executed {
+            request.is_executed = true;
+            let expiry = env.ledger().timestamp() + EMERGENCY_STOP_DURATION;
+            env.storage().instance().set(&DataKey::EmergencyStopExpiry, &expiry);
+            
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "EMERGENCY_STOP_TRIGGERED"), request.reason.clone()),
+                expiry
+            );
+        }
+
+        env.storage().instance().set(&DataKey::AuditorStopRequest, &request);
+    }
+
+    fn check_emergency_stop(env: &Env) {
+        if let Some(expiry) = env.storage().instance().get::<_, u64>(&DataKey::EmergencyStopExpiry) {
+            if env.ledger().timestamp() < expiry {
+                env.panic_with_error(ScholarError::EmergencyStopActive);
+            }
+        }
+    }
+
+    // --- Task #101: Implement Gas_Refund_Incentive_for_Account_Cleanup ---
+
+    pub fn finalize_and_close(env: Env, student: Address, caller: Address) {
+        caller.require_auth();
+        
+        // Get scholarship
+        let scholarship_key = DataKey::Scholarship(student.clone());
+        let mut scholarship: Scholarship = env.storage().persistent().get(&scholarship_key).expect("Scholarship not found");
+        
+        // Check if stream is 100% complete/graduated
+        // For this protocol, we'll define "dead" as balance == 0 or explicit finished flag if available
+        // In this implementation, let's assume balance 0 means fully claimed.
+        if scholarship.balance > 0 {
+            env.panic_with_error(ScholarError::DeadContractOnly);
+        }
+
+        // Calculate bounty from platform fee
+        let platform_fee: i128 = env.storage().instance().get(&DataKey::PlatformFeeBalance).unwrap_or(0);
+        let bounty = (platform_fee * CLEANUP_BOUNTY_PERCENT as i128) / 100;
+        
+        if bounty > 0 {
+            let client = token::Client::new(&env, &scholarship.token);
+            client.transfer(&env.current_contract_address(), &caller, &bounty);
+            
+            // Deduct from platform fee tracking
+            env.storage().instance().set(&DataKey::PlatformFeeBalance, &(platform_fee - bounty));
+        }
+
+        // Social Cleanup: Remove storage entries
+        env.storage().persistent().remove(&scholarship_key);
+        // Also remove access records if possible, but they are keyed by student+course
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "ACCOUNT_CLEANUP_BOUNTY"), student, caller),
+            bounty
+        );
     }
 }
 
