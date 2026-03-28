@@ -72,6 +72,7 @@ pub enum DataKey {
     GroupPoolAccess(u64, Address), // pool_id, member -> access granted
     ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
     ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
+    TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
 }
 
 #[contracttype]
@@ -102,6 +103,15 @@ pub struct CourseRegistry {
 #[derive(Clone)]
 pub struct RoyaltySplit {
     pub shares: Vec<(Address, u32)>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct TuitionStipendSplit {
+    pub university_address: Address,
+    pub student_address: Address,
+    pub university_percentage: u32, // Default 70
+    pub student_percentage: u32,    // Default 30
 }
 
 // Research Grant Milestone Escrow structs
@@ -261,6 +271,14 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&student, &env.current_contract_address(), &actual_cost);
 
+        // Apply tuition-stipend split for course payments
+        let (university_share, student_share) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            actual_cost, 
+            &token
+        );
+
         let mut access = env
             .storage()
             .persistent()
@@ -291,7 +309,15 @@ impl ScholarContract {
             LEDGER_BUMP_EXTEND,
         );
 
+        // Distribute royalty for course creators (separate from tuition split)
         Self::distribute_royalty(&env, course_id, actual_cost, &token);
+        
+        // Emit event with split information
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Access_Purchased"), student.clone(), course_id),
+            (actual_cost, university_share, student_share, seconds_bought)
+        );
     }
 
     pub fn set_course_duration(env: Env, course_id: u64, duration: u64) {
@@ -604,6 +630,14 @@ impl ScholarContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&funder, &env.current_contract_address(), &amount);
 
+        // Apply tuition-stipend split if configured
+        let (university_amount, student_amount) = Self::distribute_tuition_stipend_split(
+            &env, 
+            &student, 
+            amount, 
+            &token
+        );
+
         let mut scholarship: Scholarship = env
             .storage()
             .persistent()
@@ -616,12 +650,15 @@ impl ScholarContract {
                 is_paused: false,
             });
 
-        scholarship.balance += amount;
+        // Only add the student's portion to scholarship balance
+        scholarship.balance += student_amount;
+        scholarship.unlocked_balance += student_amount; // Assume funded amount is unlocked
+        
         env.storage()
             .persistent()
             .set(&DataKey::Scholarship(student.clone()), &scholarship);
 
-        // Emit Scholarship_Granted event
+        // Emit Scholarship_Granted event with split information
         #[allow(deprecated)]
         env.events().publish(
             (
@@ -629,7 +666,7 @@ impl ScholarContract {
                 funder,
                 student.clone(),
             ),
-            amount,
+            (amount, university_amount, student_amount)
         );
     }
 
@@ -1005,6 +1042,114 @@ impl ScholarContract {
                     client.transfer(&env.current_contract_address(), recipient, &share);
                 }
             }
+        }
+    }
+
+    // Tuition-Stipend Split Functions
+    
+    pub fn set_tuition_stipend_split(
+        env: Env,
+        admin: Address,
+        student: Address,
+        university_address: Address,
+        university_percentage: u32,
+        student_percentage: u32,
+    ) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        // Validate percentages sum to 100
+        if university_percentage + student_percentage != 100 {
+            panic!("Percentages must sum to 100");
+        }
+        
+        let split_config = TuitionStipendSplit {
+            university_address,
+            student_address: student.clone(),
+            university_percentage,
+            student_percentage,
+        };
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TuitionStipendSplit(student), &split_config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TuitionStipendSplit(student),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+        
+        // Emit event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "TuitionStipendSplit_Configured"), admin, student),
+            (university_address, university_percentage, student_percentage)
+        );
+    }
+    
+    pub fn get_tuition_stipend_split(env: Env, student: Address) -> Option<TuitionStipendSplit> {
+        let key = DataKey::TuitionStipendSplit(student);
+        let split = env.storage().persistent().get(&key);
+        if split.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        split
+    }
+    
+    pub fn distribute_tuition_stipend_split(
+        env: &Env,
+        student: &Address,
+        total_amount: i128,
+        token: &Address,
+    ) -> (i128, i128) {
+        let split: Option<TuitionStipendSplit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TuitionStipendSplit(student));
+        
+        let client = token::Client::new(env, token);
+        
+        if let Some(config) = split {
+            // Calculate university share (70% by default)
+            let university_share = (total_amount * config.university_percentage as i128) / 100;
+            let student_share = (total_amount * config.student_percentage as i128) / 100;
+            
+            // Transfer to university first (priority payment)
+            if university_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.university_address, &university_share);
+            }
+            
+            // Transfer remainder to student
+            if student_share > 0 {
+                client.transfer(&env.current_contract_address(), &config.student_address, &student_share);
+            }
+            
+            // Emit split distribution event
+            #[allow(deprecated)]
+            env.events().publish(
+                (Symbol::new(&env, "TuitionStipendSplit_Distributed"), student, config.university_address),
+                (university_share, student_share)
+            );
+            
+            (university_share, student_share)
+        } else {
+            // No split configured, transfer full amount to student
+            client.transfer(&env.current_contract_address(), student, &total_amount);
+            (0, total_amount)
         }
     }
 
@@ -2121,3 +2266,4 @@ impl ScholarContract {
 }
 
 mod test;
+mod tuition_stipend_split_tests;
