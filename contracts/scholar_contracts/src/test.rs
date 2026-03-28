@@ -2302,3 +2302,255 @@ fn test_tutoring_payment_processing() {
     // The test verifies the function doesn't panic
     // In a real scenario, we'd check the tutor's balance
 }
+
+// Issue #95: Alumni Donation Matching Incentive Tests
+
+#[test]
+fn test_alumni_donation_matching_with_sbt() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let alumnus = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    
+    // Mint tokens for alumnus donation
+    token_client.mint(&alumnus, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Initialize contract and set admin
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize General Excellence Fund
+    client.init_general_excellence_fund(&admin, &token_address.address());
+    
+    // Fund the General Excellence Fund
+    token_client.mint(&admin, &2000);
+    client.fund_general_excellence_fund(&admin, &1000);
+
+    // Issue Graduation SBT to alumnus
+    client.issue_graduation_sbt(&admin, &alumnus, &35); // 3.5 GPA
+
+    // Process alumni donation (should get 2:1 match)
+    let (original_amount, matched_amount) = client.process_alumni_donation(
+        &alumnus,
+        &100, // Original donation
+        &1,    // Scholarship pool ID
+        &token_address.address(),
+    );
+
+    assert_eq!(original_amount, 100);
+    assert_eq!(matched_amount, 200); // 2:1 match
+
+    // Verify donation record
+    let donation = client.get_alumni_donation(&1);
+    assert!(donation.is_some());
+    let donation = donation.unwrap();
+    assert_eq!(donation.original_amount, 100);
+    assert_eq!(donation.matched_amount, 200);
+    assert!(donation.has_graduation_sbt);
+
+    // Verify General Excellence Fund balance decreased
+    let fund = client.get_general_excellence_fund();
+    assert!(fund.is_some());
+    let fund = fund.unwrap();
+    assert_eq!(fund.total_balance, 800); // 1000 - 200 matched
+    assert_eq!(fund.total_matched, 200);
+}
+
+#[test]
+fn test_alumni_donation_without_sbt() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    
+    token_client.mint(&donor, &1000);
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Process donation without SBT (no matching)
+    let (original_amount, matched_amount) = client.process_alumni_donation(
+        &donor,
+        &100,
+        &1,
+        &token_address.address(),
+    );
+
+    assert_eq!(original_amount, 100);
+    assert_eq!(matched_amount, 0); // No match without SBT
+
+    // Verify donation record
+    let donation = client.get_alumni_donation(&1);
+    assert!(donation.is_some());
+    let donation = donation.unwrap();
+    assert!(!donation.has_graduation_sbt);
+}
+
+#[test]
+fn test_graduation_sbt_issuance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Issue graduation SBT
+    let token_id = client.issue_graduation_sbt(&admin, &student, &38); // 3.8 GPA
+
+    assert_eq!(token_id, 1);
+
+    // Verify SBT exists
+    let sbt = client.get_graduation_sbt(&student);
+    assert!(sbt.is_some());
+    let sbt = sbt.unwrap();
+    assert_eq!(sbt.gpa, 38);
+    assert!(sbt.is_verified);
+}
+
+// Issue #93: Scholarship Probation Cooling-Off Logic Tests
+
+#[test]
+fn test_probation_start_and_recovery() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund scholarship for student
+    token_client.mint(&admin, &1000);
+    client.fund_scholarship(&admin, &student, &1000, &token_address.address());
+
+    // Update GPA below threshold (should start probation)
+    client.update_student_gpa(&oracle, &student, &20); // 2.0 GPA < 2.5 threshold
+
+    // Check probation status
+    let probation = client.get_probation_status(&student);
+    assert!(probation.is_some());
+    let probation = probation.unwrap();
+    assert!(probation.is_on_probation);
+    assert_eq!(probation.violation_count, 1);
+
+    // Simulate recovery - update GPA above threshold
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1000000); // Advance time
+    client.update_student_gpa(&oracle, &student, &30); // 3.0 GPA > 2.5 threshold
+
+    // Check probation ended
+    let probation = client.get_probation_status(&student);
+    assert!(probation.is_some());
+    let probation = probation.unwrap();
+    assert!(!probation.is_on_probation);
+}
+
+#[test]
+fn test_permanent_revocation_after_warning_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund scholarship
+    token_client.mint(&admin, &1000);
+    client.fund_scholarship(&admin, &student, &1000, &token_address.address());
+
+    // Start probation with low GPA
+    client.update_student_gpa(&oracle, &student, &20); // 2.0 GPA
+
+    // Advance time beyond warning period (60 days)
+    let warning_period_end = env.ledger().timestamp() + PROBATION_WARNING_PERIOD + 1000;
+    env.ledger().set_timestamp(warning_period_end);
+
+    // Update GPA still below threshold after warning period (should revoke)
+    client.update_student_gpa(&oracle, &student, &22); // Still below 2.5 threshold
+
+    // Check probation status should be cleared (revoked)
+    let probation = client.get_probation_status(&student);
+    assert!(probation.is_none()); // Cleared after revocation
+
+    // Check scholarship is disputed/revoked
+    let scholarship = client.scholarship(&student);
+    assert!(scholarship.is_disputed);
+    assert_eq!(scholarship.dispute_reason.unwrap(), Symbol::new(&env, "PERMANENT_REVOCATION_GPA"));
+}
+
+#[test]
+fn test_gpa_update_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let student = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Update GPA
+    client.update_student_gpa(&oracle, &student, &35); // 3.5 GPA
+
+    // Check GPA update record
+    let gpa_update = client.get_gpa_update(&student);
+    assert!(gpa_update.is_some());
+    let gpa_update = gpa_update.unwrap();
+    assert_eq!(gpa_update.new_gpa, 35);
+    assert_eq!(gpa_update.previous_gpa, 0); // No previous GPA
+    assert!(gpa_update.oracle_verified);
+
+    // Update GPA again
+    client.update_student_gpa(&oracle, &student, &32); // 3.2 GPA
+
+    // Check updated record
+    let gpa_update = client.get_gpa_update(&student);
+    assert!(gpa_update.is_some());
+    let gpa_update = gpa_update.unwrap();
+    assert_eq!(gpa_update.new_gpa, 32);
+    assert_eq!(gpa_update.previous_gpa, 35); // Previous GPA tracked
+}
