@@ -624,3 +624,207 @@ fn test_calculate_remaining_airtime_zero_flow_rate() {
     // Should return 0 due to zero flow_rate guard
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 }
+
+#[test]
+fn test_ssi_verification() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.set_admin(&admin);
+    
+    // Test SSI verification with valid score
+    let verification_type = Symbol::new(&env, "gitcoin_passport");
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, b"valid_proof_data");
+    
+    client.verify_ssi_identity(&student, &verification_type, &85, &proof_data);
+    
+    // Verify SSI status
+    assert!(client.is_ssi_verified(&student));
+    assert_eq!(client.get_personhood_score(&student), 85);
+    
+    // Test SSI verification with insufficient score
+    let student2 = Address::generate(&env);
+    let proof_data2 = soroban_sdk::Bytes::from_slice(&env, b"invalid_proof_data");
+    
+    let result = std::panic::catch_unwind(|| {
+        client.verify_ssi_identity(&student2, &verification_type, &75, &proof_data2);
+    });
+    assert!(result.is_err()); // Should panic due to insufficient score
+}
+
+#[test]
+fn test_geographic_verification() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.set_admin(&admin);
+    
+    // Set regional oracle
+    let region = Symbol::new(&env, "lagos");
+    client.set_regional_oracle(&admin, &region, &oracle);
+    
+    // Verify residency
+    let geohash = soroban_sdk::Bytes::from_slice(&env, b"s1g2g3h4");
+    let proof_signature = soroban_sdk::Bytes::from_slice(&env, b"valid_signature");
+    
+    client.verify_residency(&student, &geohash, &region, &proof_signature, &oracle);
+    
+    // Check verified region
+    assert_eq!(client.get_verified_region(&student), Some(region));
+    
+    // Test location compliance
+    assert!(client.check_location_compliance(&student, &geohash));
+    assert!(!client.is_in_geographic_review(&student));
+    
+    // Test location change triggers review
+    let new_geohash = soroban_sdk::Bytes::from_slice(&env, b"different_hash");
+    assert!(!client.check_location_compliance(&student, &new_geohash));
+    assert!(client.is_in_geographic_review(&student));
+}
+
+#[test]
+fn test_stream_creation_with_ssi_requirement() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.set_admin(&admin);
+    
+    // Test high-value stream without SSI verification (should fail)
+    let high_rate = 1000; // This would be ~2.6M tokens per month
+    let result = std::panic::catch_unwind(|| {
+        client.create_stream(&funder, &student, &high_rate, &token_address.address(), None);
+    });
+    assert!(result.is_err()); // Should fail due to no SSI verification
+    
+    // Verify SSI first
+    let verification_type = Symbol::new(&env, "stellar_sep12");
+    let proof_data = soroban_sdk::Bytes::from_slice(&env, b"valid_stellar_proof");
+    client.verify_ssi_identity(&student, &verification_type, &90, &proof_data);
+    
+    // Now stream creation should succeed
+    client.create_stream(&funder, &student, &high_rate, &token_address.address(), None);
+    
+    // Test low-value stream without SSI (should succeed)
+    let student2 = Address::generate(&env);
+    let low_rate = 10; // This would be ~26K tokens per month
+    client.create_stream(&funder, &student2, &low_rate, &token_address.address(), None);
+}
+
+#[test]
+fn test_stream_with_geographic_restriction() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.set_admin(&admin);
+    
+    // Set up geographic verification
+    let region = Symbol::new(&env, "abuja");
+    client.set_regional_oracle(&admin, &region, &oracle);
+    
+    let geohash = soroban_sdk::Bytes::from_slice(&env, b"abuja_hash");
+    let proof_signature = soroban_sdk::Bytes::from_slice(&env, b"valid_abuja_proof");
+    client.verify_residency(&student, &geohash, &region, &proof_signature, &oracle);
+    
+    // Create stream with geographic restriction
+    let rate = 100;
+    client.create_stream(&funder, &student, &rate, &token_address.address(), Some(region));
+    
+    // Deposit to stream
+    client.deposit_to_stream(&funder, &student, &1000, &token_address.address());
+    
+    // Withdraw from stream
+    env.ledger().set_timestamp(100); // 100 seconds passed
+    let withdrawn = client.withdraw_from_stream(&student, &funder, &token_address.address());
+    assert_eq!(withdrawn, 100 * 100); // 100 seconds * 100 tokens/second
+    
+    // Test withdrawal during geographic review (should fail)
+    let new_geohash = soroban_sdk::Bytes::from_slice(&env, b"different_location");
+    client.check_location_compliance(&student, &new_geohash); // This triggers review
+    
+    let result = std::panic::catch_unwind(|| {
+        client.withdraw_from_stream(&student, &funder, &token_address.address());
+    });
+    assert!(result.is_err()); // Should fail due to geographic review
+}
+
+#[test]
+fn test_stream_management() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    // Create stream
+    let rate = 50;
+    client.create_stream(&funder, &student, &rate, &token_address.address(), None);
+    
+    // Deposit funds
+    client.deposit_to_stream(&funder, &student, &2000, &token_address.address());
+    
+    // Check stream balance
+    assert_eq!(client.get_stream_balance(&funder, &student), 2000);
+    
+    // Pause stream
+    client.pause_stream(&funder, &student);
+    
+    // Try to withdraw while paused (should fail)
+    let result = std::panic::catch_unwind(|| {
+        client.withdraw_from_stream(&student, &funder, &token_address.address());
+    });
+    assert!(result.is_err());
+    
+    // Resume stream
+    client.resume_stream(&funder, &student);
+    
+    // Withdraw should work now
+    env.ledger().set_timestamp(50); // 50 seconds passed
+    let withdrawn = client.withdraw_from_stream(&student, &funder, &token_address.address());
+    assert_eq!(withdrawn, 50 * 50); // 50 seconds * 50 tokens/second
+}

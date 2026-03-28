@@ -1,10 +1,24 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol};
+use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Vec, Symbol, Bytes, Map};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SbtMint(Address, u64),
+    StreamCreated(Address, Address, i128), // funder, student, amount
+    GeographicReview(Address, u64), // student, timestamp
+    SsiVerificationRequired(Address), // student
 }
+
+// Constants for SSI and geographic verification
+pub const MIN_PERSONHOOD_SCORE: u64 = 80; // Minimum verified personhood score
+pub const GEOHASH_PRECISION: u32 = 9; // Geohash precision for location verification
+pub const REVIEW_COOLDOWN: u64 = 86400; // 24 hours in seconds
+pub const LOCATION_CHECK_INTERVAL: u64 = 3600; // 1 hour in seconds
+
+// Existing constants
+pub const LEDGER_BUMP_THRESHOLD: u32 = 30 * 24 * 60 * 60; // 30 days
+pub const LEDGER_BUMP_EXTEND: u32 = 30 * 24 * 60 * 60; // 30 days  
+pub const EARLY_DROP_WINDOW_SECONDS: u64 = 300; // 5 minutes
 
 
 #[contracttype]
@@ -24,6 +38,44 @@ pub struct Access {
 pub struct Scholarship {
     pub balance: i128,
     pub token: Address,
+    pub flow_rate: i128, // tokens per second for streaming
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SsiVerification {
+    pub student: Address,
+    pub personhood_score: u64,
+    pub verification_type: Symbol, // "stellar_sep12" or "gitcoin_passport"
+    pub verified_at: u64,
+    pub expiry: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GeographicInfo {
+    pub student: Address,
+    pub geohash: Bytes,
+    pub verified_region: Symbol, // e.g., "abuja", "lagos"
+    pub proof_signature: Bytes,
+    pub oracle_address: Address,
+    pub last_location_check: u64,
+    pub in_review: bool,
+    pub review_start_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Stream {
+    pub funder: Address,
+    pub student: Address,
+    pub amount_per_second: i128,
+    pub total_deposited: i128,
+    pub total_withdrawn: i128,
+    pub start_time: u64,
+    pub is_active: bool,
+    pub geographic_restriction: Option<Symbol>, // Optional geographic restriction
 }
 
 #[contracttype]
@@ -44,6 +96,12 @@ pub enum DataKey {
     Scholarship(Address), // student -> Scholarship struct
     VetoedCourseGlobal(u64),
     Session(Address),
+    // New keys for SSI and geographic features
+    SsiVerification(Address),
+    GeographicInfo(Address),
+    Stream(Address, Address), // (funder, student) -> Stream
+    RegionalOracle(Symbol), // region -> oracle address
+    LocationVerificationCache(Address), // student -> last verified location timestamp
 }
 
 #[contracttype]
@@ -407,13 +465,7 @@ impl ScholarContract {
         let current_time = env.ledger().timestamp();
         
         if current_time > access.last_purchase_time + EARLY_DROP_WINDOW_SECONDS {
-            panic!("Refund only available within 5 minutes of purchase");
-        }
-
-        if current_time >= access.expiry_time {
-            return 0;
-        }
-
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
         }
 
         if current_time >= access.expiry_time {
@@ -448,6 +500,304 @@ impl ScholarContract {
             }
         }
         0
+    }
+
+    // SSI Verification Functions
+    
+    pub fn verify_ssi_identity(env: Env, student: Address, verification_type: Symbol, personhood_score: u64, proof_data: Bytes) {
+        student.require_auth();
+        
+        // Check if verification already exists and is still valid
+        if let Some(existing_verification) = env.storage().persistent().get::<DataKey, SsiVerification>(&DataKey::SsiVerification(student.clone())) {
+            let current_time = env.ledger().timestamp();
+            if current_time < existing_verification.expiry {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        // Verify minimum personhood score requirement
+        if personhood_score < MIN_PERSONHOOD_SCORE {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // In a real implementation, this would verify the proof data with Stellar SEP-12 or Gitcoin Passport
+        // For now, we'll accept the verification if the score meets minimum requirements
+        let current_time = env.ledger().timestamp();
+        let verification = SsiVerification {
+            student: student.clone(),
+            personhood_score,
+            verification_type,
+            verified_at: current_time,
+            expiry: current_time + (365 * 24 * 60 * 60), // 1 year validity
+        };
+        
+        env.storage().persistent().set(&DataKey::SsiVerification(student), &verification);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "SSI_VERIFIED"), student),
+            personhood_score
+        );
+    }
+    
+    pub fn is_ssi_verified(env: Env, student: Address) -> bool {
+        if let Some(verification) = env.storage().persistent().get::<DataKey, SsiVerification>(&DataKey::SsiVerification(student.clone())) {
+            let current_time = env.ledger().timestamp();
+            current_time < verification.expiry && verification.personhood_score >= MIN_PERSONHOOD_SCORE
+        } else {
+            false
+        }
+    }
+    
+    pub fn get_personhood_score(env: Env, student: Address) -> u64 {
+        if let Some(verification) = env.storage().persistent().get::<DataKey, SsiVerification>(&DataKey::SsiVerification(student)) {
+            verification.personhood_score
+        } else {
+            0
+        }
+    }
+
+    // Geographic Zoning Functions
+    
+    pub fn set_regional_oracle(env: Env, admin: Address, region: Symbol, oracle_address: Address) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        env.storage().instance().set(&DataKey::RegionalOracle(region), &oracle_address);
+    }
+    
+    pub fn verify_residency(env: Env, student: Address, geohash: Bytes, region: Symbol, proof_signature: Bytes, oracle_address: Address) {
+        student.require_auth();
+        
+        // Verify the oracle is authorized for this region
+        let authorized_oracle: Option<Address> = env.storage().instance().get(&DataKey::RegionalOracle(region.clone()));
+        if authorized_oracle.is_none() || authorized_oracle.unwrap() != oracle_address {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // In a real implementation, this would verify the proof signature with the oracle
+        // For now, we'll accept the verification if the oracle is authorized
+        let current_time = env.ledger().timestamp();
+        let geo_info = GeographicInfo {
+            student: student.clone(),
+            geohash,
+            verified_region: region,
+            proof_signature,
+            oracle_address,
+            last_location_check: current_time,
+            in_review: false,
+            review_start_time: 0,
+        };
+        
+        env.storage().persistent().set(&DataKey::GeographicInfo(student), &geo_info);
+    }
+    
+    pub fn check_location_compliance(env: Env, student: Address, current_geohash: Bytes) -> bool {
+        if let Some(mut geo_info) = env.storage().persistent().get::<DataKey, GeographicInfo>(&DataKey::GeographicInfo(student.clone())) {
+            let current_time = env.ledger().timestamp();
+            
+            // Check if enough time has passed for location verification
+            if current_time < geo_info.last_location_check + LOCATION_CHECK_INTERVAL {
+                return !geo_info.in_review; // Return current status if not time to check yet
+            }
+            
+            // In a real implementation, this would compare geohashes to detect location changes
+            // For demonstration, we'll assume any geohash change triggers review
+            if current_geohash != geo_info.geohash {
+                geo_info.in_review = true;
+                geo_info.review_start_time = current_time;
+                
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "GEO_REVIEW"), student),
+                    current_time
+                );
+            } else {
+                geo_info.in_review = false;
+                geo_info.review_start_time = 0;
+            }
+            
+            geo_info.last_location_check = current_time;
+            env.storage().persistent().set(&DataKey::GeographicInfo(student), &geo_info);
+            
+            !geo_info.in_review
+        } else {
+            true // No geographic info means no restrictions
+        }
+    }
+    
+    pub fn is_in_geographic_review(env: Env, student: Address) -> bool {
+        if let Some(geo_info) = env.storage().persistent().get::<DataKey, GeographicInfo>(&DataKey::GeographicInfo(student)) {
+            geo_info.in_review
+        } else {
+            false
+        }
+    }
+    
+    pub fn get_verified_region(env: Env, student: Address) -> Option<Symbol> {
+        if let Some(geo_info) = env.storage().persistent().get::<DataKey, GeographicInfo>(&DataKey::GeographicInfo(student)) {
+            Some(geo_info.verified_region)
+        } else {
+            None
+        }
+    }
+
+    // Stream Scholarship Functions
+    
+    pub fn create_stream(env: Env, funder: Address, student: Address, amount_per_second: i128, token: Address, geographic_restriction: Option<Symbol>) {
+        funder.require_auth();
+        
+        // Verify student has SSI verification for high-value scholarships
+        let total_monthly_amount = amount_per_second * (30 * 24 * 60 * 60) as i128;
+        if total_monthly_amount >= 1000 { // High-value threshold
+            if !Self::is_ssi_verified(env.clone(), student.clone()) {
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "SSI_REQUIRED"), student),
+                    total_monthly_amount
+                );
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        // Verify geographic restrictions if specified
+        if let Some(ref region) = geographic_restriction {
+            let student_region = Self::get_verified_region(env.clone(), student.clone());
+            if student_region.is_none() || student_region.unwrap() != *region {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+            
+            // Check if student is currently in geographic review
+            if Self::is_in_geographic_review(env.clone(), student.clone()) {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        // Check if stream already exists
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        if env.storage().persistent().has(&stream_key) {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let stream = Stream {
+            funder: funder.clone(),
+            student: student.clone(),
+            amount_per_second,
+            total_deposited: 0,
+            total_withdrawn: 0,
+            start_time: current_time,
+            is_active: true,
+            geographic_restriction,
+        };
+        
+        env.storage().persistent().set(&stream_key, &stream);
+        
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "STREAM_CREATED"), funder, student),
+            amount_per_second
+        );
+    }
+    
+    pub fn deposit_to_stream(env: Env, funder: Address, student: Address, amount: i128, token: Address) {
+        funder.require_auth();
+        
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        let mut stream = env.storage().persistent().get::<DataKey, Stream>(&stream_key)
+            .expect("Stream not found");
+        
+        if !stream.is_active {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check geographic compliance if restricted
+        if let Some(ref region) = stream.geographic_restriction {
+            if Self::is_in_geographic_review(env.clone(), student.clone()) {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        // Transfer tokens to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+        
+        stream.total_deposited += amount;
+        env.storage().persistent().set(&stream_key, &stream);
+    }
+    
+    pub fn withdraw_from_stream(env: Env, student: Address, funder: Address, token: Address) -> i128 {
+        student.require_auth();
+        
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        let mut stream = env.storage().persistent().get::<DataKey, Stream>(&stream_key)
+            .expect("Stream not found");
+        
+        if !stream.is_active {
+            env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+        }
+        
+        // Check geographic compliance if restricted
+        if let Some(ref region) = stream.geographic_restriction {
+            if Self::is_in_geographic_review(env.clone(), student.clone()) {
+                env.panic_with_error((soroban_sdk::xdr::ScErrorType::Contract, soroban_sdk::xdr::ScErrorCode::InvalidAction));
+            }
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let elapsed_seconds = current_time - stream.start_time;
+        let accrued_amount = elapsed_seconds as i128 * stream.amount_per_second;
+        let available_amount = accrued_amount - stream.total_withdrawn;
+        let total_available = (stream.total_deposited - stream.total_withdrawn).min(available_amount);
+        
+        if total_available <= 0 {
+            return 0;
+        }
+        
+        // Transfer tokens to student
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &student, &total_available);
+        
+        stream.total_withdrawn += total_available;
+        env.storage().persistent().set(&stream_key, &stream);
+        
+        total_available
+    }
+    
+    pub fn pause_stream(env: Env, funder: Address, student: Address) {
+        funder.require_auth();
+        
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        let mut stream = env.storage().persistent().get::<DataKey, Stream>(&stream_key)
+            .expect("Stream not found");
+        
+        stream.is_active = false;
+        env.storage().persistent().set(&stream_key, &stream);
+    }
+    
+    pub fn resume_stream(env: Env, funder: Address, student: Address) {
+        funder.require_auth();
+        
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        let mut stream = env.storage().persistent().get::<DataKey, Stream>(&stream_key)
+            .expect("Stream not found");
+        
+        stream.is_active = true;
+        env.storage().persistent().set(&stream_key, &stream);
+    }
+    
+    pub fn get_stream_balance(env: Env, funder: Address, student: Address) -> i128 {
+        let stream_key = DataKey::Stream(funder.clone(), student.clone());
+        if let Some(stream) = env.storage().persistent().get::<DataKey, Stream>(&stream_key) {
+            stream.total_deposited - stream.total_withdrawn
+        } else {
+            0
+        }
     }
 }
 
