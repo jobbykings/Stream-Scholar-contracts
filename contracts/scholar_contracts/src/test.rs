@@ -863,11 +863,6 @@ fn test_academic_oracle_hook() {
     );
     assert!(result2.is_err());
 }
-    // 3. Unauthorized withdrawal (mock_all_auths should normally be specific)
-    // Actually, in Soroban tests, `mock_all_auths` is very permissive.
-    // If I want to test AUTH specifically, I might want to use more fine-grained auth testing.
-    // But for this task, the implementation of `require_auth` in `lib.rs` is the key part.
-}
 
 #[test]
 fn test_course_registry_basic_functionality() {
@@ -883,9 +878,9 @@ fn test_course_registry_basic_functionality() {
     client.set_admin(&admin);
 
     // Add courses to registry
-    client.add_course_to_registry(&1, &teacher);
-    client.add_course_to_registry(&2, &teacher);
-    client.add_course_to_registry(&3, &teacher);
+    client.add_course_to_registry(&1, &teacher, &true, &true); // Free course with donations
+    client.add_course_to_registry(&2, &teacher, &false, &false); // Paid course
+    client.add_course_to_registry(&3, &teacher, &true, &false); // Free course without donations
 
     // List all courses
     let courses = client.list_courses();
@@ -939,7 +934,7 @@ fn test_course_registry_size_limit() {
     // Try to add more courses than the maximum allowed
     // This will panic when trying to add the 1001st course
     for i in 1..=1001 {
-        client.add_course_to_registry(&i, &teacher);
+        client.add_course_to_registry(&i, &teacher, &false, &false);
     }
 }
 
@@ -956,8 +951,8 @@ fn test_course_registry_duplicate_course() {
     client.init(&10, &3600, &10, &100, &60);
 
     // Add the same course twice - should panic
-    client.add_course_to_registry(&1, &teacher);
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
 }
 
 #[test]
@@ -990,7 +985,7 @@ fn test_course_registry_ttl_management() {
     client.set_admin(&admin);
 
     // Add course and verify TTL is extended
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &true, &true);
 
     // Multiple calls should extend TTL without issues
     for _ in 0..10 {
@@ -1014,7 +1009,7 @@ fn test_course_registry_gas_efficiency() {
 
     // Add a reasonable number of courses
     for i in 1..=50 {
-        client.add_course_to_registry(&i, &teacher);
+        client.add_course_to_registry(&i, &teacher, &false, &false);
     }
 
     // Test that pagination works efficiently with larger datasets
@@ -1140,7 +1135,7 @@ fn test_creator_royalty_split() {
     client.set_admin(&admin);
 
     // Add course by teacher
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
 
     // Set royalty split: 70% teacher, 30% editor
     let shares = vec![&env, (teacher.clone(), 70u32), (editor.clone(), 30u32)];
@@ -1175,7 +1170,7 @@ fn test_royalty_split_invalid_total() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     client.init(&10, &3600, &10, &100, &60);
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
 
     let bad_shares = vec![
         &env,
@@ -1202,7 +1197,7 @@ fn test_royalty_split_no_split_fallback() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     client.init(&10, &3600, &10, &100, &60);
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
 
     // No royalty split set
     let contract_before = token_client.balance(&contract_id);
@@ -1238,7 +1233,7 @@ fn test_creator_royalty_split_unauthorized() {
     client.set_admin(&admin);
 
     // Add course by teacher
-    client.add_course_to_registry(&1, &teacher);
+    client.add_course_to_registry(&1, &teacher, &false, &false);
 
     // Set royalty split: 70% teacher, 30% editor
     let shares = vec![&env, (teacher.clone(), 70u32), (editor.clone(), 30u32)];
