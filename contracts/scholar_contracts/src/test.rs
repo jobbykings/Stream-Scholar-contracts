@@ -1507,3 +1507,269 @@ fn test_research_grant_with_scholarship_coexistence() {
     let claimed_milestone = client.get_milestone_claim(&1);
     assert!(claimed_milestone.is_claimed);
 }
+
+// Multi-Sig Academic Board Review Tests
+
+#[test]
+fn test_deans_council_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+    let council_member3 = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize Dean's Council with 3 members requiring 2 signatures
+    let council_members = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone()];
+    client.init_deans_council(&admin, &council_members, &2);
+
+    // Verify council is properly initialized
+    let council = client.get_deans_council();
+    assert!(council.is_some());
+    let council = council.unwrap();
+    assert_eq!(council.members.len(), 3);
+    assert_eq!(council.required_signatures, 2);
+    assert!(council.is_active);
+}
+
+#[test]
+fn test_board_pause_request_and_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+    let council_member3 = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize Dean's Council
+    let council_members = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone()];
+    client.init_deans_council(&admin, &council_members, &2);
+
+    // Fund a scholarship for the student
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+
+    // Verify initial state - not disputed
+    assert!(!client.is_disputed(&student));
+    let scholarship = client.get_scholarship(&student);
+    assert!(!scholarship.is_disputed);
+    assert_eq!(scholarship.dispute_reason, None);
+
+    // Council member 1 initiates pause request for plagiarism
+    let reason = Symbol::new(&env, "plagiarism_suspected");
+    client.board_pause_request(&council_member1, &student, &reason);
+
+    // Verify request is created but not executed yet
+    let request = client.get_board_pause_request(&student);
+    assert!(request.is_some());
+    let request = request.unwrap();
+    assert_eq!(request.signatures.len(), 1);
+    assert!(!request.is_executed);
+    assert_eq!(request.reason, reason);
+
+    // Scholarship should still be accessible until second signature
+    assert!(!client.is_disputed(&student));
+
+    // Council member 2 signs the request
+    client.board_pause_sign(&council_member2, &student);
+
+    // Now the pause should be executed
+    assert!(client.is_disputed(&student));
+    let scholarship_after = client.get_scholarship(&student);
+    assert!(scholarship_after.is_disputed);
+    assert!(scholarship_after.is_paused);
+    assert_eq!(scholarship_after.dispute_reason, Some(reason));
+
+    // Verify request is marked as executed
+    let executed_request = client.get_board_pause_request(&student);
+    assert!(executed_request.unwrap().is_executed);
+}
+
+#[test]
+fn test_disputed_student_cannot_access_courses() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+    let council_member3 = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+    token_client.mint(&student, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize Dean's Council
+    let council_members = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone()];
+    client.init_deans_council(&admin, &council_members, &2);
+
+    // Fund scholarship and buy course access
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Verify initial access
+    assert!(client.has_access(&student, &1));
+
+    // Execute board pause for academic misconduct
+    let reason = Symbol::new(&env, "academic_misconduct");
+    client.board_pause_request(&council_member1, &student, &reason);
+    client.board_pause_sign(&council_member2, &student);
+
+    // Verify student no longer has access due to disputed status
+    assert!(!client.has_access(&student, &1));
+    assert!(client.is_disputed(&student));
+}
+
+#[test]
+fn test_final_ruling_upload() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+    let council_member3 = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize Dean's Council
+    let council_members = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone()];
+    client.init_deans_council(&admin, &council_members, &2);
+
+    // Fund scholarship
+    client.fund_scholarship(&funder, &student, &1000, &token_address.address());
+
+    // Execute board pause
+    let reason = Symbol::new(&env, "plagiarism_confirmed");
+    client.board_pause_request(&council_member1, &student, &reason);
+    client.board_pause_sign(&council_member2, &student);
+
+    // Verify disputed state
+    let scholarship = client.get_scholarship(&student);
+    assert!(scholarship.is_disputed);
+    assert_eq!(scholarship.final_ruling, None);
+
+    // Upload final ruling
+    let final_ruling = Symbol::new(&env, "scholarship_revoked_plagiarism");
+    client.upload_final_ruling(&admin, &student, &final_ruling);
+
+    // Verify ruling is recorded
+    let scholarship_after = client.get_scholarship(&student);
+    assert_eq!(scholarship_after.final_ruling, Some(final_ruling));
+    assert!(scholarship_after.is_disputed); // Still disputed until admin action
+}
+
+#[test]
+fn test_board_pause_security_checks() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+    let council_member3 = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize Dean's Council
+    let council_members = vec![&env, council_member1.clone(), council_member2.clone(), council_member3.clone()];
+    client.init_deans_council(&admin, &council_members, &2);
+
+    // Test unauthorized user cannot request pause
+    let reason = Symbol::new(&env, "test_reason");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.board_pause_request(&unauthorized_user, &student, &reason);
+    }));
+    assert!(result.is_err());
+
+    // Test unauthorized user cannot sign pause
+    client.board_pause_request(&council_member1, &student, &reason);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.board_pause_sign(&unauthorized_user, &student);
+    }));
+    assert!(result.is_err());
+
+    // Test council member cannot sign twice
+    client.board_pause_sign(&council_member2, &student); // This should succeed and execute
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.board_pause_sign(&council_member1, &student); // Try to sign again
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_deans_council_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let council_member1 = Address::generate(&env);
+    let council_member2 = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Test that council must have exactly 3 members
+    let two_members = vec![&env, council_member1.clone(), council_member2.clone()];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.init_deans_council(&admin, &two_members, &2);
+    }));
+    assert!(result.is_err());
+
+    // Test that required signatures must be 2
+    let three_members = vec![&env, council_member1.clone(), council_member2.clone(), Address::generate(&env)];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.init_deans_council(&admin, &three_members, &3);
+    }));
+    assert!(result.is_err());
+}

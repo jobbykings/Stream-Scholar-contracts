@@ -32,6 +32,9 @@ pub struct Scholarship {
     pub unlocked_balance: i128,
     pub last_verif: u64,
     pub is_paused: bool,
+    pub is_disputed: bool,
+    pub dispute_reason: Option<Symbol>,
+    pub final_ruling: Option<Symbol>,
 }
 
 #[contracttype]
@@ -73,6 +76,10 @@ pub enum DataKey {
     ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
     ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
     TuitionStipendSplit(Address), // student -> TuitionStipendSplit struct
+    // Multi-Sig Academic Board Review Keys
+    DeansCouncil,
+    BoardPauseRequest(Address), // student -> BoardPauseRequest struct
+    BoardSignature(Address, Address), // student, council_member -> signature
 }
 
 #[contracttype]
@@ -112,6 +119,26 @@ pub struct TuitionStipendSplit {
     pub student_address: Address,
     pub university_percentage: u32, // Default 70
     pub student_percentage: u32,    // Default 30
+}
+
+// Multi-Sig Academic Board Review structs
+#[contracttype]
+#[derive(Clone)]
+pub struct DeansCouncil {
+    pub members: Vec<Address>,
+    pub required_signatures: u32, // Default 2 for 2-of-3
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BoardPauseRequest {
+    pub student: Address,
+    pub reason: Symbol,
+    pub requested_at: u64,
+    pub signatures: Vec<Address>,
+    pub is_executed: bool,
+    pub executed_at: Option<u64>,
 }
 
 // Research Grant Milestone Escrow structs
@@ -492,6 +519,13 @@ impl ScholarContract {
     }
 
     pub fn has_access(env: Env, student: Address, course_id: u64) -> bool {
+        // Check if student scholarship is disputed
+        if let Some(scholarship) = env.storage().persistent().get(&DataKey::Scholarship(student.clone())) {
+            if scholarship.is_disputed {
+                return false;
+            }
+        }
+
         // Check if course is globally vetoed
         let is_globally_vetoed: bool = env
             .storage()
@@ -648,6 +682,9 @@ impl ScholarContract {
                 unlocked_balance: 0,
                 last_verif: 0,
                 is_paused: false,
+                is_disputed: false,
+                dispute_reason: None,
+                final_ruling: None,
             });
 
         // Only add the student's portion to scholarship balance
@@ -2262,6 +2299,242 @@ impl ScholarContract {
             (Symbol::new(&env, "Batch_Quiz_Proofs_Submitted"), student, course_id),
             module_ids.len()
         );
+    }
+
+    // Multi-Sig Academic Board Review Functions
+
+    pub fn init_deans_council(env: Env, admin: Address, members: Vec<Address>, required_signatures: u32) {
+        admin.require_auth();
+        
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Validate members count (should be 3 for 2-of-3)
+        if members.len() != 3 {
+            panic!("Deans Council must have exactly 3 members");
+        }
+
+        // Validate required signatures (should be 2 for 2-of-3)
+        if required_signatures != 2 {
+            panic!("Required signatures must be 2 for 2-of-3 multisig");
+        }
+
+        let council = DeansCouncil {
+            members: members.clone(),
+            required_signatures,
+            is_active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DeansCouncil, &council);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Deans_Council_Initialized"), admin),
+            (members, required_signatures)
+        );
+    }
+
+    pub fn get_deans_council(env: Env) -> Option<DeansCouncil> {
+        env.storage().instance().get(&DataKey::DeansCouncil)
+    }
+
+    fn is_council_member(env: &Env, member: &Address) -> bool {
+        if let Some(council) = env.storage().instance().get(&DataKey::DeansCouncil) {
+            council.members.contains(member) && council.is_active
+        } else {
+            false
+        }
+    }
+
+    pub fn board_pause_request(env: Env, council_member: Address, student: Address, reason: Symbol) {
+        council_member.require_auth();
+
+        // Verify caller is authorized council member
+        if !Self::is_council_member(&env, &council_member) {
+            panic!("Unauthorized: Not a council member");
+        }
+
+        // Check if there's already a pending request for this student
+        if let Some(existing_request) = env.storage().persistent().get(&DataKey::BoardPauseRequest(student.clone())) {
+            if !existing_request.is_executed {
+                panic!("Pause request already pending for this student");
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        let mut request = BoardPauseRequest {
+            student: student.clone(),
+            reason: reason.clone(),
+            requested_at: current_time,
+            signatures: Vec::new(&env),
+            is_executed: false,
+            executed_at: None,
+        };
+
+        // Add the first signature
+        request.signatures.push_back(council_member.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardPauseRequest(student.clone()), &request);
+
+        // Record the signature
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardSignature(student.clone(), council_member), &true);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Requested"), council_member, student),
+            reason
+        );
+    }
+
+    pub fn board_pause_sign(env: Env, council_member: Address, student: Address) {
+        council_member.require_auth();
+
+        // Verify caller is authorized council member
+        if !Self::is_council_member(&env, &council_member) {
+            panic!("Unauthorized: Not a council member");
+        }
+
+        // Check if this member already signed
+        if let Some(_) = env.storage().persistent().get(&DataKey::BoardSignature(student.clone(), council_member.clone())) {
+            panic!("Council member has already signed this request");
+        }
+
+        // Get the existing request
+        let mut request: BoardPauseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BoardPauseRequest(student.clone()))
+            .unwrap_or_else(|| panic!("No pause request found for this student"));
+
+        if request.is_executed {
+            panic!("Request has already been executed");
+        }
+
+        // Add the signature
+        request.signatures.push_back(council_member.clone());
+
+        // Record the signature
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardSignature(student.clone(), council_member), &true);
+
+        // Check if we have enough signatures to execute
+        let council: DeansCouncil = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeansCouncil)
+            .expect("Deans Council not initialized");
+
+        if request.signatures.len() >= council.required_signatures as usize {
+            // Execute the pause
+            Self::execute_board_pause(env.clone(), student.clone(), request.clone());
+            request.is_executed = true;
+            request.executed_at = Some(env.ledger().timestamp());
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoardPauseRequest(student), &request);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Signed"), council_member, student),
+            request.signatures.len()
+        );
+    }
+
+    fn execute_board_pause(env: Env, student: Address, request: BoardPauseRequest) {
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        scholarship.is_paused = true;
+        scholarship.is_disputed = true;
+        scholarship.dispute_reason = Some(request.reason);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Board_Pause_Executed"), student),
+            (request.signatures.len(), request.reason)
+        );
+    }
+
+    pub fn upload_final_ruling(env: Env, admin: Address, student: Address, ruling: Symbol) {
+        admin.require_auth();
+
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let mut scholarship: Scholarship = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Scholarship(student.clone()))
+            .expect("No scholarship found");
+
+        if !scholarship.is_disputed {
+            panic!("Scholarship is not in disputed state");
+        }
+
+        scholarship.final_ruling = Some(ruling.clone());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Scholarship(student.clone()), &scholarship);
+
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "Final_Ruling_Uploaded"), admin, student),
+            ruling
+        );
+    }
+
+    pub fn get_board_pause_request(env: Env, student: Address) -> Option<BoardPauseRequest> {
+        let key = DataKey::BoardPauseRequest(student);
+        let request = env.storage().persistent().get(&key);
+        if request.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+        }
+        request
+    }
+
+    pub fn is_disputed(env: Env, student: Address) -> bool {
+        let scholarship: Option<Scholarship> = env.storage().persistent().get(&DataKey::Scholarship(student));
+        scholarship.map_or(false, |s| s.is_disputed)
     }
 }
 
