@@ -36,6 +36,11 @@ const NATIVE_XLM_RESERVE: i128 = 2_0000000; // 2 XLM in stroops
 const DEFAULT_TAX_RATE_BPS: u32 = 0; // 0% default tax
 const ESTIMATED_GAS_FEE: i128 = 500000; // 0.05 XLM in stroops
 
+// Issue #124: Gas Fee Subsidy for Early Learners
+const MAX_SUBSIDIZED_STUDENTS: u32 = 100;
+const SUBSIDY_THRESHOLD: i128 = 5_0000000; // 5 XLM threshold
+const SUBSIDY_AMOUNT: i128 = 5_0000000;    // 5 XLM subsidy
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -265,6 +270,10 @@ pub enum DataKey {
     DepartmentVault(Address),              // department_manager -> DepartmentVault
     DepartmentDelegation(Address, Address), // (department_manager, student) -> DepartmentDelegation
     DepartmentDelegationCount(Address),    // department_manager -> u64 (number of active delegations)
+    // Issue #124: Gas Fee Subsidy
+    GasTreasuryToken,
+    SubsidizedStudentCount,
+    HasReceivedSubsidy(Address),
 }
 
 #[contracttype]
@@ -670,7 +679,59 @@ impl ScholarContract {
             net_claimable_amount,
         }
     }
+// --- Issue #124: Gas Fee Subsidy for Early Learners ---
 
+    /// Configures the Native XLM token address used for the Gas Treasury
+    pub fn set_gas_treasury(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin)
+            .expect("Contract not initialized");
+
+        assert_eq!(admin, stored_admin, "Only admin can set gas treasury");
+
+        env.storage().instance().set(&DataKey::GasTreasuryToken, &token);
+    }
+
+    /// Low-Friction Onboarding: Subsidizes gas for the first 100 students
+    pub fn claim_gas_subsidy(env: Env, student: Address) {
+        student.require_auth();
+
+        // 1. Verify Treasury is configured
+        let token_addr: Address = env.storage().instance().get(&DataKey::GasTreasuryToken)
+            .expect("Gas treasury not configured");
+
+        // 2. Ensure student hasn't already claimed it
+        let has_received: bool = env.storage().persistent()
+            .get(&DataKey::HasReceivedSubsidy(student.clone()))
+            .unwrap_or(false);
+        assert!(!has_received, "Student has already received a gas subsidy");
+
+        // 3. Check the 100 student limit
+        let count: u32 = env.storage().instance()
+            .get(&DataKey::SubsidizedStudentCount)
+            .unwrap_or(0);
+        assert!(count < MAX_SUBSIDIZED_STUDENTS, "Maximum number of subsidies reached");
+
+        // 4. Check student's balance against the threshold
+        let client = token::Client::new(&env, &token_addr);
+        let student_balance = client.balance(&student);
+        assert!(student_balance < SUBSIDY_THRESHOLD, "Student balance is above the subsidy threshold");
+
+        // 5. Ensure the contract has enough funds
+        let contract_balance = client.balance(&env.current_contract_address());
+        assert!(contract_balance >= SUBSIDY_AMOUNT, "Insufficient gas treasury balance");
+
+        // 6. Transfer the subsidy
+        client.transfer(&env.current_contract_address(), &student, &SUBSIDY_AMOUNT);
+
+        // 7. Update state to prevent double-claiming
+        env.storage().persistent().set(&DataKey::HasReceivedSubsidy(student.clone()), &true);
+        env.storage().instance().set(&DataKey::SubsidizedStudentCount, &(count + 1));
+
+        // 8. Publish event
+        env.events().publish((Symbol::new(&env, "gas_subsidy"), student), SUBSIDY_AMOUNT);
+    }
     // --- Issue #128: Community_Governance_Veto_on_Final_Graduation_Release ---
     pub fn initiate_final_release_vote(env: Env, student: Address) {
         student.require_auth();
