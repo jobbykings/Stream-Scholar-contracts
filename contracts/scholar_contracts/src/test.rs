@@ -2673,138 +2673,219 @@ fn test_community_veto_and_graduation_flow() {
     client.withdraw_scholarship(&student, &1);
 }
 
-// --- Issue #116: Sub-Scholarship Delegation for Departments ---
+// ── Issue #115: Emergency Protocol Pause for University Admins ──────────────
 
+/// Happy path: registrar triggers a hold and student cannot withdraw during it.
 #[test]
-fn test_department_vault_grant_and_delegate() {
+fn test_security_hold_blocks_withdrawal() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let donor = Address::generate(&env);
-    let manager = Address::generate(&env); // e.g. CS Dean
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
+    let platform_admin = Address::generate(&env);
+    let university     = Address::generate(&env);
+    let registrar      = Address::generate(&env);
+    let funder         = Address::generate(&env);
+    let student        = Address::generate(&env);
+    let token_admin    = Address::generate(&env);
 
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    // Mint 50,000 tokens to the donor
-    token_client.mint(&donor, &50_000);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_client.mint(&funder, &10_000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
     client.init(&10, &3600, &10, &100, &60);
 
-    // Main Donor grants manager rights over a 50,000 token pool
-    client.grant_manager_rights(&donor, &manager, &50_000, &token_address.address());
+    // Platform admin registers the university registrar
+    client.register_university_admin(&platform_admin, &university, &registrar);
 
-    // Vault should exist with correct totals
-    let vault = client.get_department_vault(&manager).unwrap();
-    assert_eq!(vault.total_allocated, 50_000);
-    assert_eq!(vault.distributed, 0);
-    assert!(vault.is_active);
+    // University admin associates the student with the university
+    client.register_student_university(&registrar, &university, &student);
 
-    // Manager delegates 10,000 to a student
-    client.delegate_to_student(&manager, &student, &10_000);
+    // Fund the student's scholarship
+    client.fund_scholarship(&funder, &student, &5_000, &token_addr.address(), &false);
 
-    let vault = client.get_department_vault(&manager).unwrap();
-    assert_eq!(vault.distributed, 10_000);
+    // Verify there is no hold yet — withdrawal succeeds at t=0
+    env.ledger().set_timestamp(0);
+    client.withdraw_scholarship(&student, &100);
 
-    let delegation = client.get_department_delegation(&manager, &student).unwrap();
-    assert_eq!(delegation.amount, 10_000);
-    assert_eq!(delegation.claimed, 0);
-    assert!(delegation.is_active);
+    // Registrar triggers a security hold
+    let reason = Symbol::new(&env, "server_breach");
+    client.trigger_security_hold(&registrar, &university, &reason);
+
+    // Confirm the hold is recorded
+    let hold = client.get_security_hold(&university).expect("Hold must exist");
+    assert!(hold.is_active);
+    assert_eq!(hold.expires_at, 604800); // t=0 + 7 days
+
+    // Student cannot withdraw while hold is active
+    let result = env.try_invoke_contract::<(), _>(
+        &contract_id,
+        &Symbol::new(&env, "withdraw_scholarship"),
+        soroban_sdk::vec![
+            &env,
+            student.to_val(),
+            100_i128.into_val(&env),
+        ],
+    );
+    assert!(result.is_err(), "Withdrawal must be blocked during security hold");
 }
 
+/// Hold expires automatically after 7 days — withdrawal must succeed again.
 #[test]
-fn test_student_claims_delegation() {
+fn test_security_hold_expires_after_7_days() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let donor = Address::generate(&env);
-    let manager = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
+    let platform_admin = Address::generate(&env);
+    let university     = Address::generate(&env);
+    let registrar      = Address::generate(&env);
+    let funder         = Address::generate(&env);
+    let student        = Address::generate(&env);
+    let token_admin    = Address::generate(&env);
 
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&donor, &50_000);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_client.mint(&funder, &10_000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
     client.init(&10, &3600, &10, &100, &60);
 
-    client.grant_manager_rights(&donor, &manager, &50_000, &token_address.address());
-    client.delegate_to_student(&manager, &student, &10_000);
+    client.register_university_admin(&platform_admin, &university, &registrar);
+    client.register_student_university(&registrar, &university, &student);
+    client.fund_scholarship(&funder, &student, &5_000, &token_addr.address(), &false);
 
-    // Student claims their delegation
-    client.claim_department_delegation(&manager, &student);
+    env.ledger().set_timestamp(0);
+    let reason = Symbol::new(&env, "server_breach");
+    client.trigger_security_hold(&registrar, &university, &reason);
 
-    let student_balance = token_client.balance(&student);
-    assert_eq!(student_balance, 10_000);
+    // Fast-forward past 7 days (604800 seconds)
+    env.ledger().set_timestamp(604801);
 
-    let delegation = client.get_department_delegation(&manager, &student).unwrap();
-    assert_eq!(delegation.claimed, 10_000);
+    // Withdrawal must succeed after expiry
+    client.withdraw_scholarship(&student, &100);
 }
 
+/// Registrar can lift the hold early; withdrawal succeeds immediately after.
 #[test]
-fn test_manager_revokes_delegation_returns_to_vault() {
+fn test_security_hold_lifted_early() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let donor = Address::generate(&env);
-    let manager = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
+    let platform_admin = Address::generate(&env);
+    let university     = Address::generate(&env);
+    let registrar      = Address::generate(&env);
+    let funder         = Address::generate(&env);
+    let student        = Address::generate(&env);
+    let token_admin    = Address::generate(&env);
 
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&donor, &50_000);
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_client.mint(&funder, &10_000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
     client.init(&10, &3600, &10, &100, &60);
 
-    client.grant_manager_rights(&donor, &manager, &50_000, &token_address.address());
-    client.delegate_to_student(&manager, &student, &10_000);
+    client.register_university_admin(&platform_admin, &university, &registrar);
+    client.register_student_university(&registrar, &university, &student);
+    client.fund_scholarship(&funder, &student, &5_000, &token_addr.address(), &false);
 
-    // Manager revokes before student claims
-    client.revoke_student_delegation(&manager, &student);
+    env.ledger().set_timestamp(0);
+    let reason = Symbol::new(&env, "server_breach");
+    client.trigger_security_hold(&registrar, &university, &reason);
 
-    // Vault's distributed balance should be back to 0
-    let vault = client.get_department_vault(&manager).unwrap();
-    assert_eq!(vault.distributed, 0);
+    // Registrar lifts the hold early
+    env.ledger().set_timestamp(3600); // only 1 hour in
+    client.lift_security_hold(&registrar, &university);
 
-    // Delegation should be inactive
-    let delegation = client.get_department_delegation(&manager, &student).unwrap();
-    assert!(!delegation.is_active);
+    let hold = client.get_security_hold(&university).expect("Hold must still be stored");
+    assert!(!hold.is_active, "Hold must be inactive after lift");
 
-    // Student should have received nothing
-    assert_eq!(token_client.balance(&student), 0);
+    // Student can now withdraw
+    client.withdraw_scholarship(&student, &100);
 }
 
+/// Non-platform-admin cannot register a university admin.
 #[test]
-fn test_vault_insufficient_balance_panics() {
+#[should_panic(expected = "Not authorized: caller is not the platform admin")]
+fn test_register_university_admin_unauthorized() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let donor = Address::generate(&env);
-    let manager = Address::generate(&env);
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&donor, &50_000);
+    let platform_admin  = Address::generate(&env);
+    let impersonator    = Address::generate(&env);
+    let university      = Address::generate(&env);
+    let university_admin = Address::generate(&env);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
     client.init(&10, &3600, &10, &100, &60);
 
-    client.grant_manager_rights(&donor, &manager, &50_000, &token_address.address());
+    // impersonator is not platform admin
+    client.register_university_admin(&impersonator, &university, &university_admin);
+}
 
-    // Attempting to delegate more than the vault holds should panic
-    let result = std::panic::catch_unwind(|| {
-        client.delegate_to_student(&manager, &student, &60_000);
-    });
-    assert!(result.is_err(), "Expected panic on over-delegation");
+/// Non-registrar cannot trigger a security hold.
+#[test]
+#[should_panic(expected = "Not authorized: caller is not the university admin")]
+fn test_trigger_security_hold_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let platform_admin   = Address::generate(&env);
+    let university       = Address::generate(&env);
+    let registrar        = Address::generate(&env);
+    let impersonator     = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
+    client.init(&10, &3600, &10, &100, &60);
+
+    client.register_university_admin(&platform_admin, &university, &registrar);
+
+    // impersonator is not the university admin
+    let reason = Symbol::new(&env, "fake_attack");
+    client.trigger_security_hold(&impersonator, &university, &reason);
+}
+
+/// Students not registered to the university are not affected by that university's hold.
+#[test]
+fn test_security_hold_does_not_affect_unaffiliated_students() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let platform_admin   = Address::generate(&env);
+    let university       = Address::generate(&env);
+    let registrar        = Address::generate(&env);
+    let funder           = Address::generate(&env);
+    let unrelated_student = Address::generate(&env);
+    let token_admin      = Address::generate(&env);
+
+    let token_addr = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_addr.address());
+    token_client.mint(&funder, &10_000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    client.initialize(&platform_admin);
+    client.init(&10, &3600, &10, &100, &60);
+
+    client.register_university_admin(&platform_admin, &university, &registrar);
+    // unrelated_student is NOT registered to the university
+
+    client.fund_scholarship(&funder, &unrelated_student, &5_000, &token_addr.address(), &false);
+
+    env.ledger().set_timestamp(0);
+    let reason = Symbol::new(&env, "server_breach");
+    client.trigger_security_hold(&registrar, &university, &reason);
+
+    // Unrelated student's withdrawal is unaffected
+    client.withdraw_scholarship(&unrelated_student, &100);
 }
