@@ -255,7 +255,7 @@ pub enum DataKey {
     DaoVote(Address, Bytes), // voter, logic_hash -> DaoVote struct
     LogicUpgradeProposal(u64), // proposal_id -> LogicUpgradeProposal struct
     ProposalCounter,
-    DaoMembers(Vec<Address>),
+    DaoMembersKey,
     // Task 3: Scholarship Registry entries
     ScholarshipRegistry(Address), // university_address -> ScholarshipRegistry struct
     UniversityContractIndex(Address, u64), // university, index -> contract_id
@@ -398,6 +398,33 @@ pub struct ResearchGrant {
     pub total_amount: i128,
     pub token: Address,
     pub is_locked: bool,
+}
+
+// Issue #116: Sub-Scholarship Delegation for Departments
+/// A token pool granted by the Main Donor to a department manager (e.g. CS Dean).
+/// The manager can distribute and revoke allocations among their students
+/// without requiring a central admin or DAO vote for each action.
+#[contracttype]
+#[derive(Clone)]
+pub struct DepartmentVault {
+    pub manager: Address,       // e.g. CS Dean
+    pub token: Address,
+    pub total_allocated: i128,  // Total tokens granted by the Main Donor
+    pub distributed: i128,      // Tokens already delegated to students
+    pub is_active: bool,
+    pub created_at: u64,
+}
+
+/// A per-student allocation carved out of a DepartmentVault.
+#[contracttype]
+#[derive(Clone)]
+pub struct DepartmentDelegation {
+    pub manager: Address,
+    pub student: Address,
+    pub amount: i128,
+    pub claimed: i128,
+    pub is_active: bool,
+    pub created_at: u64,
 }
 
 #[contract]
@@ -1026,4 +1053,14 @@ impl ScholarContract {
             .map(|a| a == *addr)
             .unwrap_or(false)
     }
+
+    /// Read-only: returns the delegation state for a (manager, student) pair.
+    pub fn get_department_delegation(
+        env: Env,
+        manager: Address,
+        student: Address,
+    ) -> Option<DepartmentDelegation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DepartmentDelegation(manager, student))
 }
