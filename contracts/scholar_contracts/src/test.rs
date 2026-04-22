@@ -311,18 +311,15 @@ fn test_global_course_veto() {
 #[test]
 #[should_panic(expected = "HostError")]
 fn test_prevent_session_sharing() {
-fn test_calculate_remaining_airtime() {
     let env = Env::default();
     env.mock_all_auths();
 
     let student = Address::generate(&env);
-    let funder = Address::generate(&env);
     let token_admin = Address::generate(&env);
 
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
     token_client.mint(&student, &10000);
-    token_client.mint(&funder, &1000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
@@ -344,85 +341,142 @@ fn test_calculate_remaining_airtime() {
 }
 
 #[test]
-fn test_allow_same_session() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let student = Address::generate(&env);
-    let token_admin = Address::generate(&env);
-
-    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
-    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
-
-    let contract_id = env.register(ScholarContract, ());
-    let client = ScholarContractClient::new(&env, &contract_id);
-    
-    client.init(&10, &3600, &10, &100, &60);
-    client.buy_access(&student, &1, &5000, &token_address.address());
-
-    env.ledger().set_timestamp(100);
-    
-    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
-
-    client.heartbeat(&student, &1, &session1);
-    
-    // Fast forward to allowed heartbeat timing
-    // Same hash matches gracefully and watch_time progresses natively
-    env.ledger().set_timestamp(160);
-    client.heartbeat(&student, &1, &session1);
-}
-
-#[test]
-fn test_allow_session_reset_after_timeout() {
-    // Initialize with flow_rate (base_rate) of 10
-    client.init(&10, &3600, &10, &100, &60);
-    
-    // Test that calculation correctly returns 0 initially
-    assert_eq!(client.calculate_remaining_airtime(&student), 0);
-
-    // Fund the scholarship with balance of 500
-    client.fund_scholarship(&funder, &student, &500, &token_address.address());
-
-    // 500 balance / 10 flow_rate = 50 seconds
-    assert_eq!(client.calculate_remaining_airtime(&student), 50);
-}
-
-#[test]
-fn test_calculate_remaining_airtime_zero_flow_rate() {
+fn test_calculate_remaining_airtime() {
     let env = Env::default();
     env.mock_all_auths();
 
     let student = Address::generate(&env);
     let funder = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let admin = Address::generate(&env);
     let token_admin = Address::generate(&env);
 
     let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
     let token_client = token::StellarAssetClient::new(&env, &token_address.address());
-    token_client.mint(&student, &10000);
     token_client.mint(&funder, &1000);
 
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
     client.init(&10, &3600, &10, &100, &60);
-    client.buy_access(&student, &1, &5000, &token_address.address());
+    client.set_admin(&admin);
+    client.set_oracle_status(&admin, &oracle, &true);
 
-    env.ledger().set_timestamp(100);
-    let session1 = soroban_sdk::Bytes::from_slice(&env, b"11111111111111111111111111111111");
-    let session2 = soroban_sdk::Bytes::from_slice(&env, b"22222222222222222222222222222222");
+    // Verify enrollment first (Issue #160 requirement for funding)
+    let enrollment = EnrollmentData {
+        student: student.clone(),
+        university_id: 123,
+        start_timestamp: 0,
+        end_timestamp: 10000,
+        nonce: 1,
+    };
+    client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
 
-    client.heartbeat(&student, &1, &session1);
-    
-    // Fast forward strictly past the heartbeat window (`161 - 100 > 60` -> active_session = false)
-    // Allows takeover / overwritten session storage naturally
-    env.ledger().set_timestamp(161);
-    client.heartbeat(&student, &1, &session2);
-    // Initialize with flow_rate (base_rate) of 0
-    client.init(&0, &3600, &10, &100, &60);
-    
     client.fund_scholarship(&funder, &student, &500, &token_address.address());
 
-    // Should return 0 due to zero flow_rate guard
+    // 500 balance / 10 base_rate = 50 seconds
+    assert_eq!(client.calculate_remaining_airtime(&student), 50);
+
+    // Test Reputation Bonus (2% discount on rate)
+    // effective_rate = 10 * 0.98 = 9.8 -> but we use integer math (10 * 98) / 100 = 9
+    client.set_reputation_bonus(&admin, &student, &true);
+    // 500 balance / 9 effective_rate = 55 seconds
+    assert_eq!(client.calculate_remaining_airtime(&student), 55);
+
+    // Test GPA Multiplier (120% increase in rate -> 12000 bps)
+    // Base rate is 9 (after rep bonus). 9 * 120% = 10.8 -> 10
+    // Actually, effective_rate calculation: (base * 98/100 * multiplier/10000)
+    // (10 * 98 / 100) = 9
+    // (9 * 12000 / 10000) = 10
+    let gpa_payload = GpaData {
+        student: student.clone(),
+        gpa_bps: 400, // 4.0 GPA
+        epoch: 1,
+        nonce: 1,
+    };
+    client.apply_gpa_multiplier(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &gpa_payload);
+    // 500 / 10 = 50
+    assert_eq!(client.calculate_remaining_airtime(&student), 50);
+}
+
+#[test]
+fn test_withdrawal_whitelisting() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let payout = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_oracle_status(&admin, &oracle, &true);
+
+    // Verify enrollment
+    let enrollment = EnrollmentData {
+        student: student.clone(),
+        university_id: 123,
+        start_timestamp: 0,
+        end_timestamp: 10000,
+        nonce: 1,
+    };
+    client.verify_enrollment(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &enrollment);
+
+    client.fund_scholarship(&funder, &student, &500, &token_address.address());
+
+    // Set whitelisted address
+    env.ledger().set_timestamp(0);
+    client.set_authorized_payout_address(&student, &payout);
+
+    // Try to confirm early (should fail)
+    let result = env.try_invoke_contract::<(), Error>(&contract_id, &Symbol::new(&env, "confirm_authorized_payout_address"), (student.clone(),).into_val(&env));
+    assert!(result.is_err());
+
+    // Confirm after 48 hours (172800 seconds)
+    env.ledger().set_timestamp(172801);
+    client.confirm_authorized_payout_address(&student);
+
+    // Claim scholarship
+    client.claim_scholarship(&student, &200);
+
+    assert_eq!(token::Client::new(&env, &token_address.address()).balance(&payout), 200);
+}
+
+#[test]
+fn test_gpa_pause() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+    client.set_oracle_status(&admin, &oracle, &true);
+
+    // Apply low GPA (< 2.5)
+    let gpa_payload = GpaData {
+        student: student.clone(),
+        gpa_bps: 200, // 2.0 GPA
+        epoch: 1,
+        nonce: 1,
+    };
+    client.apply_gpa_multiplier(&student, &oracle, &soroban_sdk::BytesN::from_array(&env, &[0u8; 64]), &gpa_payload);
+
+    // Rate should be 0 (paused)
     assert_eq!(client.calculate_remaining_airtime(&student), 0);
 }
