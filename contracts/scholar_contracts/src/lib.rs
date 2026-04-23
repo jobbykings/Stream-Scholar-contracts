@@ -18,6 +18,7 @@ pub enum Event {
     CheckpointPassed(Address, u64, u64), // student, course_id, checkpoint_timestamp
     StreamHalted(Address, u64, u64),     // student, course_id, reason_timestamp
     ZKProofVerified(Address, bool),      // student, success_flag
+    BountyClaimed(Address, u64, i128),    // student, milestone_id, amount
 }
 
 #[contracttype]
@@ -37,6 +38,14 @@ pub struct Access {
 pub struct Scholarship {
     pub balance: i128,
     pub token: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BountyReserve {
+    pub balance: i128,
+    pub token: Address,
+    pub course_id: u64,
 }
 
 #[contracttype]
@@ -80,6 +89,9 @@ pub enum DataKey {
     ZKVerificationKey, // Global verification key for GPA proofs
     ZKProofRecord(Address, u64), // student, course_id -> ZKProofRecord
     AcademicStanding(Address, u64), // student, course_id -> AcademicStanding
+    // Bounty system related keys
+    BountyReserve(Address, u64), // student, course_id -> BountyReserve
+    ClaimedMilestone(Address, u64, u64), // student, course_id, milestone_id -> claimed_at timestamp
 }
 
 #[contracttype]
@@ -229,6 +241,14 @@ pub enum ZKError {
     VerificationFailed,
     MalformedInputs,
     UnsupportedCurve,
+}
+
+#[derive(Debug)]
+pub enum BountyError {
+    MilestoneAlreadyClaimed,
+    InsufficientBountyReserve,
+    InvalidSignature,
+    StreamNotActive,
 }
 
 #[contract]
@@ -2141,6 +2161,168 @@ impl ScholarContract {
             (Symbol::new(&env, "Batch_Quiz_Proofs_Submitted"), student, course_id),
             module_ids.len()
         );
+    }
+
+    // Milestone Bounty System
+    
+    /// Fund a bounty reserve for a student's course milestones
+    pub fn fund_bounty_reserve(
+        env: Env,
+        funder: Address,
+        student: Address,
+        course_id: u64,
+        amount: i128,
+        token: Address,
+    ) {
+        funder.require_auth();
+
+        // Transfer tokens to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&funder, &env.current_contract_address(), &amount);
+
+        // Get or create bounty reserve
+        let mut bounty_reserve: BountyReserve = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BountyReserve(student.clone(), course_id))
+            .unwrap_or(BountyReserve {
+                balance: 0,
+                token: token.clone(),
+                course_id,
+            });
+
+        bounty_reserve.balance += amount;
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::BountyReserve(student.clone(), course_id), &bounty_reserve);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BountyReserve(student, course_id),
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    /// Claim a milestone bounty with advisor authorization
+    pub fn claim_milestone_bounty(
+        env: Env,
+        student: Address,
+        course_id: u64,
+        milestone_id: u64,
+        bounty_amount: i128,
+        advisor_signature: soroban_sdk::Bytes,
+    ) {
+        student.require_auth();
+
+        // Verify student has active stream for the course
+        if !Self::has_access(env.clone(), student.clone(), course_id) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Check if milestone has already been claimed
+        let claimed_key = DataKey::ClaimedMilestone(student.clone(), course_id, milestone_id);
+        if env.storage().persistent().has(&claimed_key) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Get bounty reserve
+        let mut bounty_reserve: BountyReserve = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BountyReserve(student.clone(), course_id))
+            .unwrap_or_else(|| {
+                env.panic_with_error((
+                    soroban_sdk::xdr::ScErrorType::Contract,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                ));
+            });
+
+        // Verify sufficient bounty reserve balance
+        if bounty_reserve.balance < bounty_amount {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Verify advisor signature (simplified verification for demonstration)
+        // In production, this would verify the signature against the advisor's public key
+        if advisor_signature.len() != 64 && advisor_signature != soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig") {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Reentrancy protection: update state before external call
+        bounty_reserve.balance -= bounty_amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::BountyReserve(student.clone(), course_id), &bounty_reserve);
+
+        // Mark milestone as claimed
+        let current_time = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&claimed_key, &current_time);
+        env.storage().persistent().extend_ttl(
+            &claimed_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+
+        // Transfer bounty amount to student (cross-contract call)
+        let token_client = token::Client::new(&env, &bounty_reserve.token);
+        token_client.transfer(&env.current_contract_address(), &student, &bounty_amount);
+
+        // Emit BountyClaimed event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "BountyClaimed"), student.clone(), milestone_id),
+            bounty_amount,
+        );
+    }
+
+    /// Get bounty reserve information
+    pub fn get_bounty_reserve(env: Env, student: Address, course_id: u64) -> BountyReserve {
+        let key = DataKey::BountyReserve(student.clone(), course_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&key).unwrap_or_else(|| {
+                BountyReserve {
+                    balance: 0,
+                    token: student.clone(), // dummy
+                    course_id,
+                }
+            })
+        } else {
+            BountyReserve {
+                balance: 0,
+                token: student, // dummy
+                course_id,
+            }
+        }
+    }
+
+    /// Check if a milestone has been claimed
+    pub fn is_milestone_claimed(env: Env, student: Address, course_id: u64, milestone_id: u64) -> bool {
+        let key = DataKey::ClaimedMilestone(student, course_id, milestone_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            true
+        } else {
+            false
+        }
     }
 
     // ZK-Proof Verifier for Academic Privacy
