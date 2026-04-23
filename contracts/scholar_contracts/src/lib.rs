@@ -62,22 +62,8 @@ const QF_MAX_PROJECTS: u64 = 500; // Max projects per round
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SbtMint(Address, u64),
-    EnrollmentVerified(Address, Address),
-    MultiplierApplied(i128, i128, u32),
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    InvalidOracleSig = 1,
-    InsufficientGpa = 2,
-    Unauthorized = 3,
-    TimelockNotExpired = 4,
-    InvalidAction = 5,
-    ReplayAttack = 6,
-    NoScholarship = 7,
-    OracleDataStale = 8,
+    CheckpointPassed(Address, u64, u64), // student, course_id, checkpoint_timestamp
+    StreamHalted(Address, u64, u64),     // student, course_id, reason_timestamp
 }
 
 
@@ -354,68 +340,25 @@ pub enum DataKey {
     Scholarship(Address),
     VetoedCourseGlobal(u64),
     Session(Address),
-    AuthorizedPayout(Address),
-    AuthorizedPayoutPending(Address),
-    UnlockTime(Address),
-    ReputationBonus(Address),
-    OracleRegistry(Address),
-    Enrollment(Address),
-    Nonce(Address),
-    GpaMultiplier(Address),
-    GpaEpoch(Address),
-    ClawbackCondition(Address, Address, u64), // (funder, student, condition_id)
-    SponsorClawbackPolicy(Address), // sponsor address
-    ClawbackHistory(Address, Address), // (funder, student)
-    ClawbackEventLog(Address, Address, u64), // (funder, student, event_id)
-    StudentProfile(Address),
-    StudentGPA(Address),
-    StudentUniversity(Address),
-    UniversityAdmin(Address),
-    SecurityHold(Address),
-    Milestone(Address, Symbol),
-    CommunityVote(Address),
-    TaxRate,
-    ResearchBonusFund,
-    LeaderboardSize,
-    HasReceivedSubsidy(Address),
-    SubsidizedStudentCount,
-    GraduationRegistry(Address),
-    QuadraticFundingRound(u64), // (round_id)
-    FundingProject(u64, u64), // (round_id, project_id)
-    QFContribution(Address, u64, u64), // (contributor, round_id, project_id)
-    MatchingDistribution(u64, u64), // (round_id, project_id)
-    RoundProjectList(u64), // (round_id)
-    ProjectContributorsList(u64, u64), // (round_id, project_id)
-    QFAdmin,
-    QFRoundCounter,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct AuthorizedPayout {
-    pub address: Address,
-    pub unlock_time: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct EnrollmentData {
-    pub student: Address,
-    pub university_id: u64,
-    pub start_timestamp: u64,
-    pub end_timestamp: u64,
-    pub generated_at: u64,
-    pub nonce: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct GpaData {
-    pub student: Address,
-    pub gpa_bps: u32, // GPA in basis points (e.g. 380 for 3.8)
-    pub epoch: u32,
-    pub generated_at: u64,
-    pub nonce: u64,
+    CourseRegistry,
+    CourseRegistrySize,
+    CourseInfo(u64),
+    BonusMinutes(Address),
+    HasBeenReferred(Address),
+    ReferralBonusAmount,
+    RoyaltySplit(u64), // course_id -> RoyaltySplit
+    // PoA (Proof-of-Attendance) related keys
+    PoAConfig,
+    AttendanceCheckpoint(u64), // checkpoint_number -> AttendanceCheckpoint
+    StudentPoAState(Address, u64), // student, course_id -> StudentPoAState
+    AttendanceProof(Address, u64, u64), // student, course_id, checkpoint_number -> AttendanceProof
+    ConsecutiveDays(Address, u64), // student, course_id -> StreakData
+    StreakBonusAmount,
+    GroupPool(u64), // pool_id -> GroupPool
+    GroupPoolMember(u64, Address), // pool_id, member -> contribution amount
+    GroupPoolAccess(u64, Address), // pool_id, member -> access granted
+    ModuleLockConfig(u64, u64), // course_id, module_id -> requires_quiz
+    ModuleQuizLock(Address, u64, u64), // student, course_id, module_id -> QuizProof
 }
 
 #[contracttype]
@@ -450,121 +393,83 @@ pub struct RoyaltySplit {
 
 #[contracttype]
 #[derive(Clone)]
-pub struct TuitionStipendSplit {
-    pub university_address: Address,
-    pub student_address: Address,
-    pub university_percentage: u32, // Default 70
-    pub student_percentage: u32,    // Default 30
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct StudentGPA {
+pub struct AttendanceProof {
     pub student: Address,
-    pub gpa: u64, // Stored as integer (e.g., 3.7 = 37)
-    pub last_updated: u64,
-    pub oracle_verified: bool,
+    pub course_id: u64,
+    pub proof_hash: soroban_sdk::Bytes,
+    pub timestamp: u64,
+    pub epoch_number: u64,
 }
 
-// Issue #128: Community Governance Veto
 #[contracttype]
-#[derive(Clone)]
-pub struct CommunityVote {
-    pub student: Address,
-    pub yes_votes: u64,
-    pub voters: Vec<Address>,
-    pub is_passed: bool,
-    pub created_at: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointState {
+    Compliant,
+    Pending,
+    Delinquent,
+    Halted,
 }
 
-// Issue #112: Scholarship Claim Dry-Run
 #[contracttype]
 #[derive(Clone)]
-pub struct ClaimSimulation {
-    pub tokens_to_release: i128,
-    pub estimated_gas_fee: i128,
-    pub tax_withholding_amount: i128,
-    pub net_claimable_amount: i128,
-}
-
-// Issue #122: On-Chain Graduation Credential Registry
-#[contracttype]
-#[derive(Clone)]
-pub struct GraduateProfile {
-    pub student: Address,
-    pub graduation_date: u64,
-    pub final_gpa: u64,
-    pub completed_scholarships: Vec<Address>, // List of funder addresses
-}
-
-// Issue #115: Emergency Protocol Pause for University Admins
-#[contracttype]
-#[derive(Clone)]
-pub struct SecurityHold {
-    pub university: Address,
-    pub triggered_by: Address,  // The university registrar/admin who triggered the hold
-    pub triggered_at: u64,
-    pub expires_at: u64,        // triggered_at + SECURITY_HOLD_DURATION (7 days)
-    pub is_active: bool,
-    pub reason: Symbol,
-}
-
-// Multi-Sig Academic Board Review structs
-#[contracttype]
-#[derive(Clone)]
-pub struct DeansCouncil {
-    pub members: Vec<Address>,
-    pub required_signatures: u32, // Default 2 for 2-of-3
+pub struct PoAConfig {
+    pub checkpoint_interval_seconds: u64,
+    pub grace_period_seconds: u64,
+    pub max_proofs_per_checkpoint: u32,
     pub is_active: bool,
 }
 
 #[contracttype]
 #[derive(Clone)]
-pub struct BoardPauseRequest {
-    pub student: Address,
-    pub reason: Symbol,
-    pub requested_at: u64,
-    pub signatures: Vec<Address>,
-    pub is_executed: bool,
-    pub executed_at: Option<u64>,
+pub struct AttendanceCheckpoint {
+    pub checkpoint_number: u64,
+    pub epoch_start: u64,
+    pub epoch_end: u64,
+    pub required_proofs: u32,
 }
 
-// Research Grant Milestone Escrow structs
 #[contracttype]
 #[derive(Clone)]
-pub struct ResearchGrant {
-    pub student_researcher: Address,
-    pub current_beneficiary: Address, // Beneficiary can be sold to an investor
-    pub total_amount: i128,
+pub struct StudentPoAState {
+    pub current_state: CheckpointState,
+    pub last_checkpoint_submitted: u64,
+    pub missed_checkpoints: u32,
+    pub grace_period_end: u64,
+    pub stream_halted_until: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct StreakData {
+    pub current_streak: u64,
+    pub last_watch_date: u64,
+    pub total_reward_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GroupPool {
+    pub pool_id: u64,
+    pub course_id: u64,
+    pub target_amount: i128,
+    pub current_balance: i128,
+    pub creator: Address,
     pub token: Address,
-    pub is_locked: bool,
-}
-
-// Issue #116: Sub-Scholarship Delegation for Departments
-/// A token pool granted by the Main Donor to a department manager (e.g. CS Dean).
-/// The manager can distribute and revoke allocations among their students
-/// without requiring a central admin or DAO vote for each action.
-#[contracttype]
-#[derive(Clone)]
-pub struct DepartmentVault {
-    pub manager: Address,       // e.g. CS Dean
-    pub token: Address,
-    pub total_allocated: i128,  // Total tokens granted by the Main Donor
-    pub distributed: i128,      // Tokens already delegated to students
     pub is_active: bool,
+    pub member_count: u64,
     pub created_at: u64,
 }
 
-/// A per-student allocation carved out of a DepartmentVault.
 #[contracttype]
 #[derive(Clone)]
-pub struct DepartmentDelegation {
-    pub manager: Address,
+pub struct QuizProof {
     pub student: Address,
-    pub amount: i128,
-    pub claimed: i128,
-    pub is_active: bool,
-    pub created_at: u64,
+    pub course_id: u64,
+    pub module_id: u64,
+    pub quiz_hash: Symbol,
+    pub score: u64,
+    pub passed_at: u64,
+    pub is_verified: bool,
 }
 
 #[contract]
@@ -587,15 +492,328 @@ impl ScholarContract {
             })
     }
 
-    /// #117: Scholarship_Marketplace_Listing_Hook
-    /// Authorizes a marketplace to lock a grant for auction to secondary investors.
-    pub fn authorize_transfer_to_marketplace(env: Env, student: Address, grant_id: u64, marketplace: Address) {
-        student.require_auth();
-        let grant: ResearchGrant = env.storage().persistent().get(&DataKey::ResearchGrant(grant_id))
-            .expect("Grant not found");
-        assert_eq!(grant.student_researcher, student, "Not the owner of this grant");
+    // PoA (Proof-of-Attendance) Configuration and Management
+    
+    pub fn init_poa_config(
+        env: Env,
+        admin: Address,
+        checkpoint_interval_seconds: u64,
+        grace_period_seconds: u64,
+        max_proofs_per_checkpoint: u32,
+    ) {
+        admin.require_auth();
         
-        let mut effective_rate = base_rate;
+        // Verify caller is admin
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if stored_admin != admin {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+        
+        let poa_config = PoAConfig {
+            checkpoint_interval_seconds,
+            grace_period_seconds,
+            max_proofs_per_checkpoint,
+            is_active: true,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::PoAConfig, &poa_config);
+    }
+
+    pub fn get_poa_config(env: Env) -> PoAConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::PoAConfig)
+            .unwrap_or(PoaConfig {
+                checkpoint_interval_seconds: 604800, // 1 week default
+                grace_period_seconds: 604800,        // 1 week grace period
+                max_proofs_per_checkpoint: 3,
+                is_active: false,
+            })
+    }
+
+    pub fn submit_attendance_proof(
+        env: Env,
+        student: Address,
+        course_id: u64,
+        proof_hashes: Vec<soroban_sdk::Bytes>,
+        timestamps: Vec<u64>,
+    ) {
+        student.require_auth();
+
+        // Verify PoA is active
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Verify student has active access to the course
+        if !Self::has_access(env.clone(), student.clone(), course_id) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // Validate input arrays
+        if proof_hashes.len() != timestamps.len() || proof_hashes.len() == 0 {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        if proof_hashes.len() > poa_config.max_proofs_per_checkpoint as usize {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        let current_time = env.ledger().timestamp();
+        
+        // Calculate current epoch/checkpoint
+        let checkpoint_number = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        // Verify all timestamps are within the current epoch
+        let checkpoint = Self::get_or_create_checkpoint(env.clone(), checkpoint_number, &poa_config);
+        
+        for i in 0..timestamps.len() {
+            let timestamp = timestamps.get(i).unwrap();
+            if *timestamp < checkpoint.epoch_start || *timestamp > checkpoint.epoch_end {
+                env.panic_with_error((
+                    soroban_sdk::xdr::ScErrorType::Contract,
+                    soroban_sdk::xdr::ScErrorCode::InvalidAction,
+                ));
+            }
+        }
+
+        // Store attendance proofs
+        for i in 0..proof_hashes.len() {
+            let proof_hash = proof_hashes.get(i).unwrap();
+            let timestamp = timestamps.get(i).unwrap();
+            
+            let attendance_proof = AttendanceProof {
+                student: student.clone(),
+                course_id,
+                proof_hash: proof_hash.clone(),
+                timestamp: *timestamp,
+                epoch_number: checkpoint_number,
+            };
+            
+            env.storage()
+                .persistent()
+                .set(&DataKey::AttendanceProof(student.clone(), course_id, checkpoint_number), &attendance_proof);
+            env.storage().persistent().extend_ttl(
+                &DataKey::AttendanceProof(student.clone(), course_id, checkpoint_number),
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
+        }
+
+        // Update student PoA state
+        Self::update_student_poa_state(env.clone(), student.clone(), course_id, checkpoint_number);
+        
+        // Emit CheckpointPassed event
+        #[allow(deprecated)]
+        env.events().publish(
+            (Symbol::new(&env, "CheckpointPassed"), student.clone(), course_id),
+            checkpoint_number,
+        );
+    }
+
+    fn calculate_current_checkpoint(env: Env, current_time: u64, poa_config: &PoAConfig) -> u64 {
+        // Simple epoch calculation starting from timestamp 0
+        current_time / poa_config.checkpoint_interval_seconds
+    }
+
+    fn get_or_create_checkpoint(env: Env, checkpoint_number: u64, poa_config: &PoAConfig) -> AttendanceCheckpoint {
+        let checkpoint_key = DataKey::AttendanceCheckpoint(checkpoint_number);
+        
+        if let Some(checkpoint) = env.storage().persistent().get(&checkpoint_key) {
+            checkpoint
+        } else {
+            // Create new checkpoint
+            let epoch_start = checkpoint_number * poa_config.checkpoint_interval_seconds;
+            let epoch_end = epoch_start + poa_config.checkpoint_interval_seconds;
+            
+            let checkpoint = AttendanceCheckpoint {
+                checkpoint_number,
+                epoch_start,
+                epoch_end,
+                required_proofs: poa_config.max_proofs_per_checkpoint,
+            };
+            
+            env.storage()
+                .persistent()
+                .set(&checkpoint_key, &checkpoint);
+            env.storage().persistent().extend_ttl(
+                &checkpoint_key,
+                LEDGER_BUMP_THRESHOLD,
+                LEDGER_BUMP_EXTEND,
+            );
+            
+            checkpoint
+        }
+    }
+
+    fn update_student_poa_state(env: Env, student: Address, course_id: u64, checkpoint_number: u64) {
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        let current_time = env.ledger().timestamp();
+        let poa_config = Self::get_poa_config(env.clone());
+        
+        let mut poa_state: StudentPoAState = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            });
+
+        // Check if this is a late submission (after grace period)
+        let expected_checkpoint = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        if checkpoint_number < expected_checkpoint {
+            // This is a late submission for a previous checkpoint
+            let grace_period_end = checkpoint_number * poa_config.checkpoint_interval_seconds + poa_config.grace_period_seconds;
+            
+            if current_time > grace_period_end {
+                // Too late - mark as delinquent and halt stream
+                poa_state.current_state = CheckpointState::Delinquent;
+                poa_state.stream_halted_until = current_time + poa_config.checkpoint_interval_seconds;
+                
+                // Emit StreamHalted event
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "StreamHalted"), student.clone(), course_id),
+                    current_time,
+                );
+            } else {
+                // Within grace period - update to compliant
+                poa_state.current_state = CheckpointState::Compliant;
+                poa_state.missed_checkpoints = 0;
+                poa_state.grace_period_end = 0;
+            }
+        } else {
+            // Current or future checkpoint - mark as compliant
+            poa_state.current_state = CheckpointState::Compliant;
+            poa_state.missed_checkpoints = 0;
+            poa_state.grace_period_end = 0;
+        }
+
+        poa_state.last_checkpoint_submitted = checkpoint_number;
+        
+        env.storage()
+            .persistent()
+            .set(&state_key, &poa_state);
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            LEDGER_BUMP_THRESHOLD,
+            LEDGER_BUMP_EXTEND,
+        );
+    }
+
+    pub fn check_poa_compliance(env: Env, student: Address, course_id: u64) -> bool {
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            return true; // PoA not active, no compliance check needed
+        }
+
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        let poa_state: Option<StudentPoAState> = env.storage().persistent().get(&state_key);
+        
+        if let Some(state) = poa_state {
+            let current_time = env.ledger().timestamp();
+            
+            // Check if stream is currently halted
+            if current_time < state.stream_halted_until {
+                return false;
+            }
+            
+            // Check if in grace period
+            if current_time < state.grace_period_end {
+                return false;
+            }
+            
+            // Check if delinquent
+            if state.current_state == CheckpointState::Delinquent {
+                return false;
+            }
+            
+            true
+        } else {
+            // No PoA state yet, assume compliant
+            true
+        }
+    }
+
+    pub fn get_student_poa_state(env: Env, student: Address, course_id: u64) -> StudentPoAState {
+        let state_key = DataKey::StudentPoAState(student.clone(), course_id);
+        if env.storage().persistent().has(&state_key) {
+            env.storage().persistent().extend_ttl(&state_key, LEDGER_BUMP_THRESHOLD, LEDGER_BUMP_EXTEND);
+            env.storage().persistent().get(&state_key).unwrap_or(StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            })
+        } else {
+            StudentPoAState {
+                current_state: CheckpointState::Compliant,
+                last_checkpoint_submitted: 0,
+                missed_checkpoints: 0,
+                grace_period_end: 0,
+                stream_halted_until: 0,
+            }
+        }
+    }
+
+    pub fn process_missed_checkpoints(env: Env) {
+        let poa_config = Self::get_poa_config(env.clone());
+        if !poa_config.is_active {
+            return;
+        }
+
+        let current_time = env.ledger().timestamp();
+        let current_checkpoint = Self::calculate_current_checkpoint(env.clone(), current_time, &poa_config);
+        
+        // This would typically be called by a cron job or admin
+        // For now, it's a manual function to check for missed checkpoints
+        // In production, you'd want to iterate through all active students
+    }
+
+    fn calculate_dynamic_rate(env: Env, student: Address, course_id: u64) -> i128 {
+        let base_rate: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BaseRate)
+            .unwrap_or(1);
+        let discount_threshold: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountThreshold)
+            .unwrap_or(3600); // 1 hour default
+        let discount_percentage: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DiscountPercentage)
+            .unwrap_or(10); // 10% default
 
         // Apply Reputation Bonus (2% discount)
         let has_reputation_bonus: bool = env.storage().instance().get(&DataKey::ReputationBonus(student.clone())).unwrap_or(false);
@@ -732,10 +950,41 @@ impl ScholarContract {
             panic!("Amount exceeds available unlocked balance");
         }
 
-        // Issue #118: Native XLM Reserve
-        if scholarship.is_native {
-            if scholarship.balance - amount < NATIVE_XLM_RESERVE {
-                panic!("Withdrawal would leave less than the 2 XLM gas reserve");
+        // Verify PoA compliance
+        if !Self::check_poa_compliance(env.clone(), student.clone(), course_id) {
+            env.panic_with_error((
+                soroban_sdk::xdr::ScErrorType::Contract,
+                soroban_sdk::xdr::ScErrorCode::InvalidAction,
+            ));
+        }
+
+        // SBT Minting Trigger logic
+        let course_duration: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CourseDuration(course_id))
+            .unwrap_or(0);
+        if course_duration > 0 && access.total_watch_time >= course_duration {
+            let is_minted: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SbtMinted(student.clone(), course_id))
+                .unwrap_or(false);
+            if !is_minted {
+                // Trigger SBT Minting Event
+                #[allow(deprecated)]
+                env.events().publish(
+                    (Symbol::new(&env, "SBT_Mint"), student.clone(), course_id),
+                    course_id,
+                );
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::SbtMinted(student.clone(), course_id), &true);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::SbtMinted(student.clone(), course_id),
+                    LEDGER_BUMP_THRESHOLD,
+                    LEDGER_BUMP_EXTEND,
+                );
             }
         }
 
@@ -820,20 +1069,20 @@ impl ScholarContract {
             }
         }
 
-        if tokens_to_release < 0 {
-            tokens_to_release = 0;
+        // Check subscription first
+        if Self::has_active_subscription(env.clone(), student.clone(), course_id) {
+            // Even with subscription, check PoA compliance
+            return Self::check_poa_compliance(env.clone(), student.clone(), course_id);
         }
 
         let tax_rate_bps: u32 = env.storage().instance().get(&DataKey::TaxRate).unwrap_or(0);
         let tax_withholding_amount = (tokens_to_release * tax_rate_bps as i128) / 10000;
         let net_claimable_amount = tokens_to_release - tax_withholding_amount;
 
-        ClaimSimulation {
-            tokens_to_release,
-            estimated_gas_fee: ESTIMATED_GAS_FEE,
-            tax_withholding_amount,
-            net_claimable_amount,
-        }
+        let time_valid = env.ledger().timestamp() < access.expiry_time;
+        let poa_compliant = Self::check_poa_compliance(env.clone(), student.clone(), course_id);
+        
+        time_valid && poa_compliant
     }
 // --- Issue #124: Gas Fee Subsidy for Early Learners ---
 
