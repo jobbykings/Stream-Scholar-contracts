@@ -1384,3 +1384,424 @@ fn test_poa_fuzz_concurrent_submissions() {
         client.submit_attendance_proof(student, &1, &extra_hashes, &extra_timestamps);
     }).expect_err("Should panic when exceeding max proofs per checkpoint");
 }
+
+// ZK-Proof Verification Tests
+
+#[test]
+fn test_zk_verification_key_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create a mock verification key (200 bytes minimum)
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+
+    // Initialize verification key
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Verification should work now
+    assert!(true); // If we get here, initialization succeeded
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_zk_verification_key_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+
+    // Try to initialize with unauthorized address
+    client.init_zk_verification_key(&unauthorized, &verification_key);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_zk_verification_key_invalid_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Create verification key that's too short (< 200 bytes)
+    let short_vk = soroban_sdk::Bytes::from_slice(&env, b"short_key");
+
+    // Should fail with invalid format
+    client.init_zk_verification_key(&admin, &short_vk);
+}
+
+#[test]
+fn test_gpa_threshold_proof_verification_valid() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Create a valid mock proof
+    let valid_proof = create_mock_gpa_proof(&env, true);
+    
+    // Verify the proof
+    let result = client.verify_gpa_threshold_proof(&student, &1, &valid_proof);
+    
+    // Should succeed with our simplified verification
+    assert!(result);
+    
+    // Check academic standing
+    assert!(client.has_academic_standing(&student, &1));
+    
+    let standing = client.get_academic_standing(&student, &1);
+    assert!(standing.semester_passed);
+    assert_eq!(standing.course_id, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_gpa_threshold_proof_verification_invalid_format() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Create an invalid proof with wrong format
+    let invalid_proof = create_invalid_format_proof(&env);
+    
+    // Should panic due to invalid format
+    client.verify_gpa_threshold_proof(&student, &1, &invalid_proof);
+}
+
+#[test]
+fn test_gpa_threshold_proof_verification_empty_proof() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Create an empty proof
+    let empty_proof = GPAThresholdProof {
+        a: soroban_sdk::Bytes::new(&env),
+        b: soroban_sdk::Bytes::new(&env),
+        c: soroban_sdk::Bytes::new(&env),
+        public_signals: soroban_sdk::Bytes::new(&env),
+    };
+    
+    // Verify the empty proof
+    let result = client.verify_gpa_threshold_proof(&student, &1, &empty_proof);
+    
+    // Should fail with empty proof
+    assert!(!result);
+    
+    // Academic standing should not be granted
+    assert!(!client.has_academic_standing(&student, &1));
+}
+
+#[test]
+fn test_batch_verify_gpa_proofs() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Create multiple proofs
+    let course_ids = vec![&env, 1, 2, 3];
+    let proofs = vec![
+        &env,
+        create_mock_gpa_proof(&env, true),
+        create_mock_gpa_proof(&env, true),
+        create_mock_gpa_proof(&env, true),
+    ];
+    
+    // Batch verify
+    let results = client.batch_verify_gpa_proofs(&student, &course_ids, &proofs);
+    
+    // All should succeed
+    assert_eq!(results.len(), 3);
+    for i in 0..results.len() {
+        assert!(results.get(i).unwrap());
+    }
+    
+    // All courses should have academic standing
+    assert!(client.has_academic_standing(&student, &1));
+    assert!(client.has_academic_standing(&student, &2));
+    assert!(client.has_academic_standing(&student, &3));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_batch_verify_mismatched_lengths() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // Create mismatched arrays
+    let course_ids = vec![&env, 1, 2]; // 2 courses
+    let proofs = vec![
+        &env,
+        create_mock_gpa_proof(&env, true),
+        create_mock_gpa_proof(&env, true),
+        create_mock_gpa_proof(&env, true),
+    ]; // 3 proofs
+    
+    // Should panic due to mismatched lengths
+    client.batch_verify_gpa_proofs(&student, &course_ids, &proofs);
+}
+
+#[test]
+fn test_revoke_academic_standing() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Initialize verification key
+    let mut vk_bytes = Vec::<u8>::new(&env);
+    for i in 0..200 {
+        vk_bytes.push_back(i as u8);
+    }
+    let verification_key = soroban_sdk::Bytes::from_slice(&env, &vk_bytes.to_array());
+    client.init_zk_verification_key(&admin, &verification_key);
+
+    // First, grant academic standing
+    let valid_proof = create_mock_gpa_proof(&env, true);
+    let result = client.verify_gpa_threshold_proof(&student, &1, &valid_proof);
+    assert!(result);
+    assert!(client.has_academic_standing(&student, &1));
+
+    // Revoke academic standing
+    client.revoke_academic_standing(&admin, &student, &1);
+
+    // Should no longer have academic standing
+    assert!(!client.has_academic_standing(&student, &1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_revoke_academic_standing_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Try to revoke with unauthorized address
+    client.revoke_academic_standing(&unauthorized, &student, &1);
+}
+
+#[test]
+fn test_benchmark_verification() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Create a mock proof
+    let proof = create_mock_gpa_proof(&env, true);
+    
+    // Benchmark verification
+    let instructions_used = client.benchmark_verification(&proof);
+    
+    // Should use some instructions (greater than 0)
+    assert!(instructions_used > 0);
+    
+    // Should be reasonable (less than 1 million instructions for basic validation)
+    assert!(instructions_used < 1_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Academic standing not found")]
+fn test_get_academic_standing_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    // Try to get academic standing that doesn't exist
+    client.get_academic_standing(&student, &1);
+}
+
+// Helper functions for testing
+
+fn create_mock_gpa_proof(env: &Env, valid: bool) -> GPAThresholdProof {
+    if valid {
+        // Create a valid format proof
+        let mut a_bytes = Vec::<u8>::new(env);
+        let mut b_bytes = Vec::<u8>::new(env);
+        let mut c_bytes = Vec::<u8>::new(env);
+        let mut signals_bytes = Vec::<u8>::new(env);
+        
+        // G1 points (64 bytes each)
+        for i in 0..64 {
+            a_bytes.push_back(i as u8);
+            c_bytes.push_back((i + 64) as u8);
+        }
+        
+        // G2 point (128 bytes)
+        for i in 0..128 {
+            b_bytes.push_back((i + 128) as u8);
+        }
+        
+        // Public signals (96 bytes minimum - 3 * 32 bytes)
+        for i in 0..96 {
+            signals_bytes.push_back((i + 256) as u8);
+        }
+        
+        GPAThresholdProof {
+            a: soroban_sdk::Bytes::from_slice(env, &a_bytes.to_array()),
+            b: soroban_sdk::Bytes::from_slice(env, &b_bytes.to_array()),
+            c: soroban_sdk::Bytes::from_slice(env, &c_bytes.to_array()),
+            public_signals: soroban_sdk::Bytes::from_slice(env, &signals_bytes.to_array()),
+        }
+    } else {
+        // Create an invalid proof (empty)
+        GPAThresholdProof {
+            a: soroban_sdk::Bytes::new(env),
+            b: soroban_sdk::Bytes::new(env),
+            c: soroban_sdk::Bytes::new(env),
+            public_signals: soroban_sdk::Bytes::new(env),
+        }
+    }
+}
+
+fn create_invalid_format_proof(env: &Env) -> GPAThresholdProof {
+    // Create a proof with invalid format (wrong sizes)
+    let mut a_bytes = Vec::<u8>::new(env);
+    let mut b_bytes = Vec::<u8>::new(env);
+    let mut c_bytes = Vec::<u8>::new(env);
+    let mut signals_bytes = Vec::<u8>::new(env);
+    
+    // Wrong sizes to trigger validation failure
+    for i in 0..32 { // Should be 64 for G1
+        a_bytes.push_back(i as u8);
+    }
+    
+    for i in 0..64 { // Should be 128 for G2
+        b_bytes.push_back((i + 32) as u8);
+    }
+    
+    for i in 0..32 { // Should be 64 for G1
+        c_bytes.push_back((i + 96) as u8);
+    }
+    
+    for i in 0..32 { // Should be at least 96 for signals
+        signals_bytes.push_back((i + 128) as u8);
+    }
+    
+    GPAThresholdProof {
+        a: soroban_sdk::Bytes::from_slice(env, &a_bytes.to_array()),
+        b: soroban_sdk::Bytes::from_slice(env, &b_bytes.to_array()),
+        c: soroban_sdk::Bytes::from_slice(env, &c_bytes.to_array()),
+        public_signals: soroban_sdk::Bytes::from_slice(env, &signals_bytes.to_array()),
+    }
+}
