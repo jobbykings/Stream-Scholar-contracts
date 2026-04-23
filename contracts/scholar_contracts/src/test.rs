@@ -1805,3 +1805,298 @@ fn create_invalid_format_proof(env: &Env) -> GPAThresholdProof {
         public_signals: soroban_sdk::Bytes::from_slice(env, &signals_bytes.to_array()),
     }
 }
+
+// Milestone Bounty Tests
+
+#[test]
+fn test_bounty_reserve_funding() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy token and contract
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund bounty reserve with 500 tokens
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+
+    // Verify bounty reserve balance
+    let bounty_reserve = client.get_bounty_reserve(&student, &1);
+    assert_eq!(bounty_reserve.balance, 500);
+    assert_eq!(bounty_reserve.course_id, 1);
+
+    // Verify token balances
+    assert_eq!(token_client.balance(&funder), 500);
+    assert_eq!(token_client.balance(&contract_id), 500);
+}
+
+#[test]
+fn test_milestone_bounty_claim_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    // Deploy token and contract
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+    token_client.mint(&student, &100);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Student buys access to course
+    client.buy_access(&student, &1, &100, &token_address.address());
+
+    // Fund bounty reserve
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+
+    // Claim milestone bounty with valid advisor signature
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+    client.claim_milestone_bounty(&student, &1, &1, &200, &advisor_sig);
+
+    // Verify milestone marked as claimed
+    assert!(client.is_milestone_claimed(&student, &1, &1));
+
+    // Verify bounty reserve balance decreased
+    let bounty_reserve = client.get_bounty_reserve(&student, &1);
+    assert_eq!(bounty_reserve.balance, 300);
+
+    // Verify student received bounty
+    assert_eq!(token_client.balance(&student), 300); // 100 initial + 200 bounty
+
+    // Verify continuous stream access still works
+    assert!(client.has_access(&student, &1));
+}
+
+#[test]
+fn test_milestone_double_claim_prevention() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+    token_client.mint(&student, &100);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+
+    // First claim should succeed
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+    client.claim_milestone_bounty(&student, &1, &1, &200, &advisor_sig);
+
+    // Second claim should fail
+    let result = env.try_invoke_contract::<soroban_sdk::xdr::ScVal>(
+        &contract_id,
+        &Symbol::new(&env, "claim_milestone_bounty"),
+        (
+            &student,
+            &1u64, // course_id
+            &1u64, // milestone_id (same as before)
+            &200i128, // bounty_amount
+            &advisor_sig,
+        ),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_bounty_insufficient_reserve() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+    token_client.mint(&student, &100);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+    client.fund_bounty_reserve(&funder, &student, &1, &100, &token_address.address()); // Only 100 tokens
+
+    // Try to claim 200 tokens - should fail
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+    let result = env.try_invoke_contract::<soroban_sdk::xdr::ScVal>(
+        &contract_id,
+        &Symbol::new(&env, "claim_milestone_bounty"),
+        (
+            &student,
+            &1u64,
+            &1u64,
+            &200i128, // More than available
+            &advisor_sig,
+        ),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_bounty_requires_active_stream() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    // Fund bounty reserve but don't buy access
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+
+    // Try to claim without active access - should fail
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+    let result = env.try_invoke_contract::<soroban_sdk::xdr::ScVal>(
+        &contract_id,
+        &Symbol::new(&env, "claim_milestone_bounty"),
+        (
+            &student,
+            &1u64,
+            &1u64,
+            &200i128,
+            &advisor_sig,
+        ),
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_bounty_stream_parameters_unaffected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &1000);
+    token_client.mint(&student, &500);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60); // 10 tokens/second
+    client.set_admin(&admin);
+
+    // Buy access for 30 seconds (300 tokens)
+    client.buy_access(&student, &1, &300, &token_address.address());
+
+    // Fund and claim bounty
+    client.fund_bounty_reserve(&funder, &student, &1, &500, &token_address.address());
+    
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+    client.claim_milestone_bounty(&student, &1, &1, &200, &advisor_sig);
+
+    // Verify stream access still works and time not affected
+    env.ledger().set_timestamp(10);
+    assert!(client.has_access(&student, &1));
+
+    env.ledger().set_timestamp(30);
+    assert!(client.has_access(&student, &1));
+
+    env.ledger().set_timestamp(31);
+    assert!(!client.has_access(&student, &1)); // Stream should expire at original time
+
+    // Verify student has both remaining stream time and bounty
+    assert_eq!(token_client.balance(&student), 400); // 200 remaining + 200 bounty
+}
+
+#[test]
+fn test_multiple_milestone_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let student = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&funder, &2000);
+    token_client.mint(&student, &100);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+
+    client.init(&10, &3600, &10, &100, &60);
+    client.set_admin(&admin);
+
+    client.buy_access(&student, &1, &100, &token_address.address());
+    client.fund_bounty_reserve(&funder, &student, &1, &1000, &token_address.address());
+
+    let advisor_sig = soroban_sdk::Bytes::from_slice(&env, b"test_advisor_sig");
+
+    // Claim multiple different milestones
+    client.claim_milestone_bounty(&student, &1, &1, &200, &advisor_sig);
+    client.claim_milestone_bounty(&student, &1, &2, &300, &advisor_sig);
+    client.claim_milestone_bounty(&student, &1, &3, &250, &advisor_sig);
+
+    // Verify all milestones marked as claimed
+    assert!(client.is_milestone_claimed(&student, &1, &1));
+    assert!(client.is_milestone_claimed(&student, &1, &2));
+    assert!(client.is_milestone_claimed(&student, &1, &3));
+
+    // Verify final bounty reserve balance
+    let bounty_reserve = client.get_bounty_reserve(&student, &1);
+    assert_eq!(bounty_reserve.balance, 250); // 1000 - 200 - 300 - 250
+
+    // Verify student received all bounties
+    assert_eq!(token_client.balance(&student), 850); // 100 initial + 200 + 300 + 250
+}
