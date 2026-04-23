@@ -52,6 +52,12 @@ const DEFAULT_CLAWBACK_COOLDOWN: u64 = 2592000; // 30 days
 const CLAWBACK_EXECUTION_TIMEOUT: u64 = 604800; // 7 days
 const MAX_CLAWBACK_PERCENTAGE: u64 = 100; // Max 100% can be clawed back
 
+// Matching-Pool Quadratic Funding constants
+const QF_ROUND_DURATION: u64 = 2592000; // 30-day funding rounds
+const QF_MIN_CONTRIBUTION: i128 = 1_0000000; // 1 XLM minimum contribution
+const QF_MATCHING_POOL_RESERVE: i128 = 10000_0000000; // 10,000 XLM matching pool reserve
+const QF_MAX_PROJECTS: u64 = 500; // Max projects per round
+
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -278,6 +284,58 @@ pub struct SponsorClawbackPolicy {
     pub is_active: bool,
 }
 
+// Matching-Pool Quadratic Funding structs
+#[contracttype]
+#[derive(Clone)]
+pub struct QuadraticFundingRound {
+    pub round_id: u64,
+    pub token: Address,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub matching_pool_balance: i128,
+    pub total_contributions: i128,
+    pub total_matching_distributed: i128,
+    pub project_count: u64,
+    pub is_active: bool,
+    pub is_finalized: bool,
+    pub created_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FundingProject {
+    pub project_id: u64,
+    pub round_id: u64,
+    pub project_owner: Address,
+    pub title: Symbol,
+    pub total_raised: i128,
+    pub contributor_count: u64,
+    pub sqrt_sum_contributions: i128, // For QF formula: sum of sqrt(contributions)
+    pub total_matching: i128,
+    pub created_at: u64,
+    pub is_approved: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct QFContribution {
+    pub contributor: Address,
+    pub project_id: u64,
+    pub round_id: u64,
+    pub amount: i128,
+    pub contribution_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct MatchingDistribution {
+    pub round_id: u64,
+    pub project_id: u64,
+    pub matching_amount: i128,
+    pub distributed_at: u64,
+    pub project_owner: Address,
+}
+
 
 #[contracttype]
 pub enum DataKey {
@@ -322,6 +380,14 @@ pub enum DataKey {
     HasReceivedSubsidy(Address),
     SubsidizedStudentCount,
     GraduationRegistry(Address),
+    QuadraticFundingRound(u64), // (round_id)
+    FundingProject(u64, u64), // (round_id, project_id)
+    QFContribution(Address, u64, u64), // (contributor, round_id, project_id)
+    MatchingDistribution(u64, u64), // (round_id, project_id)
+    RoundProjectList(u64), // (round_id)
+    ProjectContributorsList(u64, u64), // (round_id, project_id)
+    QFAdmin,
+    QFRoundCounter,
 }
 
 #[contracttype]
@@ -1768,6 +1834,410 @@ impl ScholarContract {
         let gpa_check = Self::check_gpa_threshold(env, student, 25); // 2.5 GPA threshold
         let inactivity_check = Self::check_activity_inactive(env, student, 30);
         gpa_check && inactivity_check
+    }
+
+    // --- Matching-Pool Quadratic Funding Implementation ---
+
+    /// Initialize a new quadratic funding round
+    pub fn init_quadratic_funding_round(
+        env: Env,
+        admin: Address,
+        token: Address,
+        matching_pool_amount: i128,
+    ) -> u64 {
+        admin.require_auth();
+
+        if matching_pool_amount < QF_MATCHING_POOL_RESERVE {
+            panic!("Matching pool amount is below minimum reserve");
+        }
+
+        // Get next round ID
+        let round_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::QFRoundCounter)
+            .unwrap_or(0);
+        let round_id = round_counter + 1;
+
+        let now = env.ledger().timestamp();
+        let end_time = now + QF_ROUND_DURATION;
+
+        let round = QuadraticFundingRound {
+            round_id,
+            token: token.clone(),
+            start_time: now,
+            end_time,
+            matching_pool_balance: matching_pool_amount,
+            total_contributions: 0,
+            total_matching_distributed: 0,
+            project_count: 0,
+            is_active: true,
+            is_finalized: false,
+            created_by: admin.clone(),
+        };
+
+        // Transfer matching pool tokens to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&admin, &env.current_contract_address(), &matching_pool_amount);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::QFRoundCounter, &round_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_round_created"), round_id as u64),
+            (matching_pool_amount, end_time),
+        );
+
+        round_id
+    }
+
+    /// Register a project for a QF round
+    pub fn register_qf_project(
+        env: Env,
+        project_owner: Address,
+        round_id: u64,
+        title: Symbol,
+    ) -> u64 {
+        project_owner.require_auth();
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_active {
+            panic!("QF round is not active");
+        }
+
+        if round.project_count >= QF_MAX_PROJECTS {
+            panic!("Maximum projects per round reached");
+        }
+
+        let now = env.ledger().timestamp();
+        if now > round.end_time {
+            panic!("QF round has ended");
+        }
+
+        let project_id = round.project_count + 1;
+
+        let project = FundingProject {
+            project_id,
+            round_id,
+            project_owner: project_owner.clone(),
+            title,
+            total_raised: 0,
+            contributor_count: 0,
+            sqrt_sum_contributions: 0,
+            total_matching: 0,
+            created_at: now,
+            is_approved: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        round.project_count += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_project_registered"), round_id, project_id as u64),
+            project_owner,
+        );
+
+        project_id
+    }
+
+    /// Contribute to a project in QF round
+    pub fn contribute_to_qf_project(
+        env: Env,
+        contributor: Address,
+        round_id: u64,
+        project_id: u64,
+        amount: i128,
+    ) {
+        contributor.require_auth();
+
+        if amount < QF_MIN_CONTRIBUTION {
+            panic!("Contribution amount is below minimum");
+        }
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_active {
+            panic!("QF round is not active");
+        }
+
+        let now = env.ledger().timestamp();
+        if now > round.end_time {
+            panic!("QF round has ended");
+        }
+
+        let mut project: FundingProject = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+            .expect("Project not found");
+
+        if !project.is_approved {
+            panic!("Project is not approved");
+        }
+
+        // Record contribution
+        let contribution = QFContribution {
+            contributor: contributor.clone(),
+            project_id,
+            round_id,
+            amount,
+            contribution_time: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::QFContribution(contributor.clone(), round_id, project_id), &contribution);
+
+        // Update project stats
+        project.total_raised += amount;
+        project.contributor_count += 1;
+
+        // Calculate sqrt of contribution for QF formula
+        let sqrt_amount = Self::isqrt(amount);
+        project.sqrt_sum_contributions += sqrt_amount;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        // Update round stats
+        round.total_contributions += amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        // Transfer contribution tokens to contract
+        let client = token::Client::new(&env, &round.token);
+        client.transfer(&contributor, &env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_contributed"), contributor, round_id, project_id as u64),
+            amount,
+        );
+    }
+
+    /// Finalize QF round and calculate matching amounts
+    pub fn finalize_qf_round(env: Env, admin: Address, round_id: u64) {
+        admin.require_auth();
+
+        let mut round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if round.is_finalized {
+            panic!("QF round is already finalized");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < round.end_time {
+            panic!("QF round has not ended yet");
+        }
+
+        // Calculate matching amounts for all projects using QF formula
+        // Matching = (Σ√contribution)² - Σcontribution
+        let total_sqrt_sum: i128 = Self::calculate_total_sqrt_sum(&env, round_id);
+        let total_matching_budget = (total_sqrt_sum * total_sqrt_sum) - round.total_contributions;
+
+        if total_matching_budget <= 0 || total_matching_budget > round.matching_pool_balance {
+            panic!("Matching budget calculation failed");
+        }
+
+        // Distribute matching to projects
+        let mut total_distributed: i128 = 0;
+        for project_idx in 1..=round.project_count {
+            if let Some(mut project) = env
+                .storage()
+                .persistent()
+                .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
+            {
+                if project.sqrt_sum_contributions > 0 {
+                    let project_matching = ((project.sqrt_sum_contributions * project.sqrt_sum_contributions)
+                        - project.total_raised)
+                        .max(0);
+
+                    if project_matching > 0 {
+                        project.total_matching = project_matching;
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::FundingProject(round_id, project_idx), &project);
+
+                        // Record matching distribution
+                        let distribution = MatchingDistribution {
+                            round_id,
+                            project_id: project_idx,
+                            matching_amount: project_matching,
+                            distributed_at: now,
+                            project_owner: project.project_owner.clone(),
+                        };
+
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::MatchingDistribution(round_id, project_idx), &distribution);
+
+                        total_distributed += project_matching;
+                    }
+                }
+            }
+        }
+
+        round.total_matching_distributed = total_distributed;
+        round.is_finalized = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::QuadraticFundingRound(round_id), &round);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_round_finalized"), round_id),
+            (total_distributed, round.total_contributions),
+        );
+    }
+
+    /// Claim matching funds for a project
+    pub fn claim_qf_matching(env: Env, project_owner: Address, round_id: u64, project_id: u64) {
+        project_owner.require_auth();
+
+        let round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        if !round.is_finalized {
+            panic!("QF round has not been finalized yet");
+        }
+
+        let mut project: FundingProject = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+            .expect("Project not found");
+
+        if project.project_owner != project_owner {
+            panic!("Only project owner can claim matching funds");
+        }
+
+        if project.total_matching <= 0 {
+            panic!("No matching funds to claim");
+        }
+
+        let matching_amount = project.total_matching;
+        project.total_matching = 0; // Prevent double-claiming
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FundingProject(round_id, project_id), &project);
+
+        // Transfer matching funds to project owner
+        let client = token::Client::new(&env, &round.token);
+        client.transfer(&env.current_contract_address(), &project_owner, &matching_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "qf_matching_claimed"), round_id, project_id as u64),
+            matching_amount,
+        );
+    }
+
+    /// Get QF round details
+    pub fn get_qf_round(env: Env, round_id: u64) -> Option<QuadraticFundingRound> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+    }
+
+    /// Get project details
+    pub fn get_qf_project(env: Env, round_id: u64, project_id: u64) -> Option<FundingProject> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FundingProject(round_id, project_id))
+    }
+
+    /// Get contribution details
+    pub fn get_qf_contribution(
+        env: Env,
+        contributor: Address,
+        round_id: u64,
+        project_id: u64,
+    ) -> Option<QFContribution> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::QFContribution(contributor, round_id, project_id))
+    }
+
+    /// Get matching distribution for a project
+    pub fn get_qf_matching_distribution(
+        env: Env,
+        round_id: u64,
+        project_id: u64,
+    ) -> Option<MatchingDistribution> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MatchingDistribution(round_id, project_id))
+    }
+
+    // --- QF Helper Functions ---
+
+    /// Integer square root calculation
+    fn isqrt(n: i128) -> i128 {
+        if n < 0 {
+            return 0;
+        }
+        if n == 0 {
+            return 0;
+        }
+
+        let mut x = n;
+        let mut y = (x + 1) / 2;
+
+        while y < x {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+
+        x
+    }
+
+    /// Calculate total sqrt sum across all projects in a round
+    fn calculate_total_sqrt_sum(env: &Env, round_id: u64) -> i128 {
+        let round: QuadraticFundingRound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::QuadraticFundingRound(round_id))
+            .expect("QF round not found");
+
+        let mut total_sqrt = 0i128;
+        for project_idx in 1..=round.project_count {
+            if let Some(project) = env
+                .storage()
+                .persistent()
+                .get::<_, FundingProject>(&DataKey::FundingProject(round_id, project_idx))
+            {
+                total_sqrt += project.sqrt_sum_contributions;
+            }
+        }
+
+        total_sqrt
     }
 }
 
