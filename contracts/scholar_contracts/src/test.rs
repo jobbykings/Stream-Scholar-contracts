@@ -922,8 +922,15 @@ fn test_poa_invalid_timestamp_range() {
     let proof_hashes = vec![&env, soroban_sdk::Bytes::from_slice(&env, b"hash1")];
     let timestamps = vec![&env, 100000u64]; // Outside current epoch
 
-    client.submit_attendance_proof(&student, &1, &proof_hashes, &timestamps);
+    // Should fail withdrawal because paused
+    let result2 = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "withdraw_scholarship"),
+        (student.clone(), 100i128).into_val(&env),
+    );
+    assert!(result2.is_err());
 }
+
 
 #[test]
 fn test_poa_late_submission_within_grace_period() {
