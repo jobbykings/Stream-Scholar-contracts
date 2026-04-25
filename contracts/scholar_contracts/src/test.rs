@@ -23,7 +23,9 @@ fn test_scholarship_flow() {
     let client = ScholarContractClient::new(&env, &contract_id);
 
     // Initialize the contract with new parameters
-    client.init(&10, &3600, &10, &100, &60); // base_rate, threshold, discount%, min_deposit, heartbeat_interval
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Student buys access to course 1 for 100 tokens (should be 10 seconds at base rate)
     client.buy_access(&student, &1, &100, &token_address.address());
@@ -63,7 +65,9 @@ fn test_subscription_flow() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Buy subscription for courses 1,2,3 for 1 month
     let course_ids = vec![&env, 1, 2, 3];
@@ -93,7 +97,9 @@ fn test_dynamic_pricing() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60); // 10% discount after 1 hour
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council); // 10% discount after 1 hour
 
     // Buy initial access and establish watch time
     client.buy_access(&student, &1, &72000, &token_address.address()); // 2 hours of access
@@ -128,7 +134,9 @@ fn test_minimum_deposit() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60); // 100 token minimum deposit
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council); // 100 token minimum deposit
 
     // Should fail with amount below minimum
     let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
@@ -163,7 +171,9 @@ fn test_book_stipend_voucher_flow() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Add verified bookstore
     client.add_verified_bookstore(&donor, &bookstore);
@@ -200,7 +210,9 @@ fn test_book_stipend_voucher_unauthorized_bookstore() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Create voucher without adding verified bookstore
     client.create_book_stipend_voucher(&donor, &student, &200, &book_token_address.address(), &30);
@@ -234,7 +246,9 @@ fn test_gpa_verification_flow() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Student submits GPA proof (simulated)
     let proof_hash = Bytes::from_slice(&env, b"zk_proof_hash");
@@ -261,7 +275,9 @@ fn test_gpa_verification_expired() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Student submits GPA proof
     let proof_hash = Bytes::from_slice(&env, b"zk_proof_hash");
@@ -288,7 +304,9 @@ fn test_soulbound_credential_flow() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Mint soulbound credential
     let major = Bytes::from_slice(&env, b"Computer Science");
@@ -319,7 +337,9 @@ fn test_soulbound_credential_transfer_blocked() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Mint soulbound credential
     let major = Bytes::from_slice(&env, b"Computer Science");
@@ -352,7 +372,9 @@ fn test_learning_velocity_score_flow() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Set Grant Stream contract address
     client.set_grant_stream_contract(&admin, &grant_stream_contract);
@@ -387,7 +409,9 @@ fn test_cross_contract_reputation_query() {
     let contract_id = env.register(ScholarContract, ());
     let client = ScholarContractClient::new(&env, &contract_id);
     
-    client.init(&10, &3600, &10, &100, &60);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
 
     // Update learning velocity score first
     client.update_learning_velocity_score(&student, &10, &50); // Higher score
@@ -396,4 +420,341 @@ fn test_cross_contract_reputation_query() {
     let score = client.cross_contract_reputation_query(&student, &requesting_contract);
     assert_eq!(score.score, 200); // (10 * 1000) / 50 = 200
     assert_eq!(score.courses_completed, 10);
+}
+
+// Tests for Issue #182: SEP-12 AML/KYC Gating for Mega-Donors
+#[test]
+fn test_mega_donor_kyc_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let donor = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &100000); // Large amount
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Set mega-donor threshold to $60k
+    client.set_mega_donor_threshold(&security_council, &60000);
+
+    // Mega-donor deposit should succeed (KYC check passes in test)
+    client.deposit_funds(&donor, &70000, &token_address.address());
+    
+    assert_eq!(token_client.balance(&donor), 30000);
+    assert_eq!(client.get_tracked_tvl(), 70000);
+}
+
+#[test]
+fn test_regular_donor_no_kyc_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let donor = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let security_council = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Regular donor deposit should succeed without KYC check
+    client.deposit_funds(&donor, &1000, &token_address.address());
+    
+    assert_eq!(token_client.balance(&donor), 0);
+    assert_eq!(client.get_tracked_tvl(), 1000);
+}
+
+// Tests for Issue #183: Circuit Breaker: Protocol-Wide Emergency Pause
+#[test]
+fn test_emergency_pause_blocks_operations() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let student = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&student, &1000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Trigger emergency pause
+    client.trigger_emergency_pause(&security_council);
+    assert!(client.is_paused());
+
+    // Operations should fail while paused
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "buy_access"),
+        Vec::from_array(&env, [
+            student.into_val(&env),
+            1_u64.into_val(&env),
+            100_i128.into_val(&env),
+            token_address.address().into_val(&env)
+        ])
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_protocol_resume() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Trigger emergency pause
+    client.trigger_emergency_pause(&security_council);
+    assert!(client.is_paused());
+
+    // Resume protocol
+    client.resume_protocol(&security_council);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_unauthorized_pause_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let unauthorized_user = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Unauthorized user should not be able to pause
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "trigger_emergency_pause"),
+        Vec::from_array(&env, [
+            unauthorized_user.into_val(&env)
+        ])
+    );
+    assert!(result.is_err());
+}
+
+// Tests for Issue #184: Flash-Loan Defense on Matching Pools
+#[test]
+fn test_flash_loan_defense_blocks_instant_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let depositor = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&depositor, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Set settling period to 10 ledgers
+    client.set_settling_period(&security_council, &10);
+
+    env.ledger().set_timestamp(0);
+    
+    // Make initial deposit
+    client.deposit_with_match(&depositor, &5000, &token_address.address(), &1000);
+    
+    // Try to use the same deposit for matching immediately (should fail)
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "deposit_with_match"),
+        Vec::from_array(&env, [
+            depositor.into_val(&env),
+            5000_i128.into_val(&env),
+            token_address.address().into_val(&env),
+            1000_i128.into_val(&env)
+        ])
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_settled_deposit_allows_matching() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let depositor = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&depositor, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Set settling period to 3 ledgers
+    client.set_settling_period(&security_council, &3);
+
+    env.ledger().set_timestamp(0);
+    
+    // Make initial deposit
+    client.deposit_with_match(&depositor, &5000, &token_address.address(), &1000);
+    
+    // Wait for settling period to pass
+    env.ledger().set_timestamp(5);
+    
+    // Now matching should work (different deposit)
+    client.deposit_with_match(&depositor, &2000, &token_address.address(), &500);
+    
+    assert_eq!(token_client.balance(&depositor), 1500); // 10000 - 6000 - 2500 = 1500
+    assert_eq!(client.get_tracked_tvl(), 8500); // 6000 + 2500 = 8500
+}
+
+// Tests for Issue #185: Regulated Asset (SEP-08) Clawback Accounting
+#[test]
+fn test_clawback_detection_and_handling() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let donor = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Make deposit
+    client.deposit_funds(&donor, &5000, &token_address.address());
+    assert_eq!(client.get_tracked_tvl(), 5000);
+    
+    // Simulate external clawback by reducing token balance
+    token_client.burn(&contract_id, &1000);
+    
+    // Calculate flow should detect clawback
+    env.ledger().set_timestamp(200); // Trigger balance check
+    let flow = client.calculate_flow(&token_address.address());
+    
+    // Tracked TVL should be updated to actual balance
+    assert_eq!(flow, 4000);
+    assert_eq!(client.get_tracked_tvl(), 4000);
+}
+
+#[test]
+fn test_no_clawback_normal_operation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let donor = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&donor, &10000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Make deposit
+    client.deposit_funds(&donor, &5000, &token_address.address());
+    assert_eq!(client.get_tracked_tvl(), 5000);
+    
+    // No clawback - balances should match
+    env.ledger().set_timestamp(200);
+    let flow = client.calculate_flow(&token_address.address());
+    
+    assert_eq!(flow, 5000);
+    assert_eq!(client.get_tracked_tvl(), 5000);
+}
+
+// Integration test combining multiple security features
+#[test]
+fn test_security_features_integration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let mega_donor = Address::generate(&env);
+    let security_council = Address::generate(&env);
+    let sep12_oracle = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+
+    let token_address = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_client = token::StellarAssetClient::new(&env, &token_address.address());
+    token_client.mint(&mega_donor, &100000);
+
+    let contract_id = env.register(ScholarContract, ());
+    let client = ScholarContractClient::new(&env, &contract_id);
+    
+    client.init(&10, &3600, &10, &100, &60, &sep12_oracle, &security_council);
+
+    // Set low mega-donor threshold for testing
+    client.set_mega_donor_threshold(&security_council, &1000);
+    
+    // Mega-donor deposit should succeed with KYC check
+    client.deposit_funds(&mega_donor, &50000, &token_address.address());
+    
+    // Trigger emergency pause
+    client.trigger_emergency_pause(&security_council);
+    
+    // Further deposits should be blocked
+    let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "deposit_funds"),
+        Vec::from_array(&env, [
+            mega_donor.into_val(&env),
+            1000_i128.into_val(&env),
+            token_address.address().into_val(&env)
+        ])
+    );
+    assert!(result.is_err());
+    
+    // Resume protocol
+    client.resume_protocol(&security_council);
+    
+    // Deposits should work again
+    client.deposit_funds(&mega_donor, &1000, &token_address.address());
+    
+    assert_eq!(client.get_tracked_tvl(), 51000);
 }
